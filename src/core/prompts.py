@@ -153,38 +153,81 @@ Return JSON only:
 
 def skill_extraction_prompt(result: ResearchResult) -> str:
     """
-    技能提取提示词
+    技能提取提示词（参考 Anthropic Skill-Creator 范式）
 
-    从研究会话中识别可复用的研究策略和模式，
-    存入技能记忆供未来研究调用。
+    核心设计原则（来自 Anthropic Agent Skills / Claude Code skill-creator）:
+
+    1. **Discoverability via description**
+       - name + description 必须能让一个完全不了解当前研究的 agent
+         仅凭这两个字段判断 "是否该调用此技能"，不能泛泛而谈
+       - description 长度 80-200 字符，前半段是"何时用"，后半段是"做什么"
+
+    2. **Concrete over abstract**
+       - 禁止 "做好研究" 这类空话，必须写具体操作
+       - 最少包含一个 action verb 和一个 measurable outcome
+
+    3. **Self-contained & progressive disclosure**
+       - content 字段要包含完整的 step-by-step 指令，不依赖外部上下文
+       - 结构：triggers / inputs / steps / outputs / anti-patterns
+
+    4. **Anti-patterns are mandatory**
+       - 写清楚 "什么时候不该用这个技能"，防止误触发
+
+    5. **Verifiable trigger conditions**
+       - trigger_conditions 必须是可由后续 router / planner 机械判断的条件
+       - 格式：列出 3-5 个触发信号，每条不超过一行
     """
     task_summaries = "\n\n".join(
-        f"Task: {t.task.title}\nGoal: {t.task.goal}\nSearch Query: {t.task.search_query}"
+        f"Task: {t.task.title}\n"
+        f"Goal: {t.task.goal}\n"
+        f"Search Query: {t.task.search_query}\n"
+        f"Confidence: {t.confidence:.2f}\n"
+        f"Summary: {t.summary_markdown[:400]}"
         for t in result.task_results
     )
-    return f"""
-You are a self-learning research agent extracting reusable research skills from a completed session.
+    return f"""You are a skill curator for a research agent, following the Anthropic skill-creator methodology.
+
+Your job: examine a completed research session and extract reusable skills that would genuinely help future research on DIFFERENT topics. This is not a summary of what happened — it is abstracting patterns that generalize.
+
+# Research Session to Analyze
 
 Topic: {result.topic}
 
-Research Plan Used:
+Task trace:
 {task_summaries}
 
-Identify 1-3 reusable research strategies or patterns from this session that would help future research.
+# Skill Quality Bar (Anthropic Skill-Creator Style)
+
+A skill is worth extracting ONLY if all of the following hold:
+- It describes a **reusable procedure**, not a one-off observation
+- The procedure worked in this session (average confidence >= 0.5)
+- The procedure is NOT trivially obvious (e.g. "use google to search" is not a skill)
+- A model without prior context can execute the procedure purely from the skill's content field
+
+If fewer than 1 pattern clears this bar, return an empty list. DO NOT pad.
+
+# Output Format
+
 Return JSON only:
 {{
   "skills": [
     {{
-      "name": "short skill name",
-      "description": "what this skill does",
-      "trigger_conditions": "when to apply this skill (e.g. 'when researching survey papers')",
-      "content": "the actual strategy or pattern in 1-3 sentences",
-      "domain": "research domain (e.g. machine_learning, nlp, computer_vision, general)"
+      "name": "verb-phrase-kebab-case (<= 5 words)",
+      "description": "One 80-200 char sentence: when to use + what it does. Must be discoverable by keyword match. Example: 'When evaluating a novel method combination with limited prior art, search each component separately then synthesize overlap gaps.'",
+      "trigger_conditions": "3-5 bullet signals, one per line with '- ' prefix. Must be mechanically checkable, e.g. '- user query contains \\"novel combination\\" or \\"新组合\\"' or '- planning phase for a topic with <5 exact-match papers'",
+      "content": "# Procedure\\n\\n## When to use\\n<concrete triggers>\\n\\n## Inputs needed\\n<list>\\n\\n## Steps\\n1. <action verb + measurable outcome>\\n2. ...\\n\\n## Outputs\\n<list>\\n\\n## Anti-patterns\\n- <when NOT to use>\\n\\n## Example\\n<concrete mini-example from this session>",
+      "domain": "one of: research_methodology | search_strategy | evidence_synthesis | evaluation | writing | general"
     }}
   ]
 }}
 
-Only extract genuinely reusable patterns. Return empty skills list if nothing is worth saving.
+# Additional Rules
+
+- "content" MUST be a full multi-section markdown block using the template above, not 1-3 sentences
+- Use \\n for newlines inside JSON strings
+- Do not reference the specific topic "{result.topic}" in name/description — skills must generalize
+- If you find only 1 high-quality skill, return 1. Never inflate to 3.
+- Maximum 3 skills per session.
 """.strip()
 
 

@@ -17,6 +17,8 @@ class Settings:
     search_backend: str = "duckduckgo"
     search_top_k: int = 6
     memory_top_k: int = 4
+    memory_episode_k: int = 3
+    memory_skill_k: int = 3
     context_max_chars: int = 7000
     max_reflection_rounds: int = 1
     max_revision_rounds: int = 2
@@ -46,6 +48,8 @@ class Settings:
             search_backend=os.getenv("SEARCH_BACKEND", "duckduckgo"),
             search_top_k=int(os.getenv("SEARCH_TOP_K", "6")),
             memory_top_k=int(os.getenv("MEMORY_TOP_K", "4")),
+            memory_episode_k=int(os.getenv("MEMORY_EPISODE_K", "3")),
+            memory_skill_k=int(os.getenv("MEMORY_SKILL_K", "3")),
             context_max_chars=int(os.getenv("CONTEXT_MAX_CHARS", "7000")),
             max_reflection_rounds=int(os.getenv("MAX_REFLECTION_ROUNDS", "1")),
             max_revision_rounds=int(os.getenv("MAX_REVISION_ROUNDS", "2")),

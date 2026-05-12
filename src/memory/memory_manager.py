@@ -35,7 +35,7 @@ class MemoryManager:
     """
 
     # 召回阶段的扩大倍数（召回更多再让 reranker 精排）
-    RECALL_MULTIPLIER = 3
+    RECALL_MULTIPLIER = 4
 
     def __init__(self, settings: Settings, enable_rerank: Optional[bool] = None):
         mem_dir = settings.workspace_dir / "memory"
@@ -65,6 +65,8 @@ class MemoryManager:
         )
 
         self._top_k = settings.memory_top_k
+        self._ep_k = settings.memory_episode_k
+        self._sk_k = settings.memory_skill_k
 
         # 技能使用追踪：最近一次 get_context_for_task 返回的技能 id 列表
         # 研究完成后 ReflectionEngine 会按质量反馈成功与否
@@ -108,11 +110,11 @@ class MemoryManager:
 
         # 2. 如果未启用 rerank，走原路径
         if not self.enable_rerank or self.reranker is None:
-            sk_returned = skills[:3]
+            sk_returned = skills[:self._sk_k]
             self._last_used_skill_ids = [s.id for s in sk_returned]
             return {
                 "session": self.session.get_context(),
-                "episodes": episodes[:3],
+                "episodes": episodes[:self._ep_k],
                 "skills": sk_returned,
                 "vectors": vectors[:self._top_k],
                 "reranked": [],
@@ -120,11 +122,13 @@ class MemoryManager:
 
         # 3. 构建统一候选并精排
         candidates = build_candidates_from_memory(episodes, skills, vectors)
-        reranked = self.reranker.rerank(query, candidates, top_k=self._top_k * 2)
+        # 给下游三路分流留足空间：ep_k + sk_k + top_k
+        rerank_output_k = self._ep_k + self._sk_k + self._top_k
+        reranked = self.reranker.rerank(query, candidates, top_k=rerank_output_k)
 
         # 4. 按 source 回填
-        ep_reranked = [c.raw for c in reranked if c.source == "episode"][:3]
-        sk_reranked = [c.raw for c in reranked if c.source == "skill"][:3]
+        ep_reranked = [c.raw for c in reranked if c.source == "episode"][:self._ep_k]
+        sk_reranked = [c.raw for c in reranked if c.source == "skill"][:self._sk_k]
         vec_reranked = [c.raw for c in reranked if c.source == "vector"][:self._top_k]
 
         # 记录本轮精排后实际要注入的技能 id
@@ -152,13 +156,20 @@ class MemoryManager:
                 )
 
         if ctx["skills"]:
-            parts.append("### 已学研究技能")
+            parts.append("### 已学研究技能（按 skill-creator 范式组织）")
             for sk in ctx["skills"]:
-                parts.append(
-                    f"**{sk.name}** [{sk.domain}]\n"
-                    f"触发条件: {sk.trigger_conditions}\n"
-                    f"{sk.content}"
+                # 先给 planner 看 description（最精炼） + trigger（判断是否匹配）
+                # 再附 content 前 800 字符（完整 procedure 的头部，够用）
+                head = (
+                    f"**{sk.name}** [{sk.domain}]  "
+                    f"(使用 {sk.usage_count} 次, 成功率 {sk.success_rate:.2f})\n"
+                    f"_说明_: {sk.description}\n"
+                    f"_触发_: {sk.trigger_conditions}"
                 )
+                body = sk.content[:800]
+                if len(sk.content) > 800:
+                    body += "\n...(truncated)"
+                parts.append(f"{head}\n\n{body}")
 
         if ctx["vectors"]:
             parts.append("### 语义记忆片段")
@@ -261,11 +272,14 @@ class MemoryManager:
             content=content,
             domain=domain,
         )
-        # 镜像到向量库：name + trigger + content 作为语义载荷
+        # 镜像到向量库：description + trigger + content
+        # description 首当其冲（它本身就是 discoverability 设计）
+        # content 可能很长，截断到 1500 字符避免过度占用向量空间
+        payload = f"{description}\n触发: {trigger_conditions}\n{content[:1500]}"
         self.vector.add(
             f"skill:{skill_id}",
-            f"{name}\n触发: {trigger_conditions}\n{content}",
-            {"type": "skill", "skill_id": skill_id, "domain": domain},
+            payload,
+            {"type": "skill", "skill_id": skill_id, "domain": domain, "name": name},
         )
         return skill_id
 

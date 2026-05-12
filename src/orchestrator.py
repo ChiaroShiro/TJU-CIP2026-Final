@@ -20,7 +20,7 @@ from .core.prompts import (
     memory_augmented_planner_prompt, planner_prompt,
     summarizer_prompt, reflection_prompt, reporter_prompt,
 )
-from .core.utils import extract_json_object, truncate_text
+from .core.utils import extract_json_object
 from .learning.reflection import ReflectionEngine
 
 

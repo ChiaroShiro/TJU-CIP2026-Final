@@ -205,8 +205,11 @@ deep_research_agent/
 ├── main.py                    # CLI 入口
 ├── requirements.txt
 ├── environment.yml
-├── ARCHITECTURE.md            # 详细架构文档
-└── ROADMAP.md                 # 未来发展路线图
+└── docs/                      # 详细文档（不发布，本地查看）
+    ├── ARCHITECTURE.md        # 完整架构说明
+    ├── MEMORY.md              # 三层记忆系统详解
+    ├── LEARNING.md            # 反思引擎详解
+    └── ROADMAP.md             # 未来发展路线图
 ```
 
 ### 核心组件
@@ -303,8 +306,16 @@ result = mcp.call_tool("custom_tool", {"param1": "value", "param2": 42})
 
 ## 📚 文档
 
-- [📐 架构详解](ARCHITECTURE.md) - 详细的代码架构和设计文档
-- [🗺️ 发展路线图](ROADMAP.md) - 未来功能规划和优先级
+- [📐 架构详解](docs/ARCHITECTURE.md) - 详细的代码架构和设计文档
+- [🧠 记忆系统详解](docs/MEMORY.md) - 三层记忆 + rerank 实现
+- [🎓 学习引擎详解](docs/LEARNING.md) - ReflectionEngine 反思闭环
+- [🗺️ 发展路线图](docs/ROADMAP.md) - 未来功能规划和优先级
+
+### 当前开发重点（见 ROADMAP）
+
+- 🚧 **优先级 1** - 自编排式 Agent 重构（把固定管线换成 ReAct-style autonomous loop）
+- 📋 **优先级 2** - Summarizer 加全文阅读能力（让 research 不再只看 abstract）
+- 📋 **优先级 3** - 接入 WebSearch，突破 arXiv 的学术信息墙
 
 ---
 
