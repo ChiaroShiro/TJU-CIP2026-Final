@@ -376,6 +376,15 @@ registry.register(my_tool)
 - [arXiv](https://arxiv.org/) - 开放获取的预印本论文库
 - [Semantic Scholar](https://www.semanticscholar.org/) - 学术搜索引擎
 - [OpenAI](https://openai.com/) - LLM API 提供商
+- [DeepSeek](https://www.deepseek.com/) - 高性价比 LLM 服务，本项目默认使用
+- [Anthropic Agent Skills](https://docs.anthropic.com/) - 项目中的 skill-creator 范式参考
+- [dailypaper-skills](https://github.com/) - 论文阅读模块的多源图片 fallback、零遗漏原则、概念库联动等设计参考自该项目的 `paper-reader` skill；具体借鉴点包括：
+  - 多源图片获取流程（arXiv HTML → 项目主页 → PDF 提取）
+  - 公式 5 类必检规范（变量冲突 / 文本-公式不一致 / 符号约定不一致 / 求和范围错 / 缺算子）
+  - URL 规范化（防止 arxiv_id 路径重复 bug）
+  - 图片可达性检查 + 选择性本地化（不可达自动下载到 `assets/`）
+  - 概念库自动维护（`[[Concept]]` 链接对应独立概念笔记）
+  - 笔记模板结构（YAML frontmatter + 一句话总结 + 核心贡献 + 方法详解 + 关键公式 + 关键图表 + 批判性思考 + 速查卡片）
 
 ---
 
