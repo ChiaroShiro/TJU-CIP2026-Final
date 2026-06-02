@@ -1,30 +1,29 @@
 """
-论文全文获取服务 - 从 arXiv 下载 PDF 并提取结构化全文
+论文全文获取服务。
 
-核心能力：
-- 按 arXiv ID 下载 PDF（带本地缓存，不重复下载）
-- 用 PyMuPDF 提取文本，按页和章节切分
-- 识别常见章节（Abstract / Introduction / Method / Experiments / Conclusion / References）
-- 返回结构化全文给下游 Agent 分析
+支持两种来源：
+1. 通过 arXiv ID 下载 PDF 并提取全文
+2. 直接读取本地 PDF 并提取全文
 """
 
 import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 import requests
 
 
 @dataclass
 class PaperFullText:
-    """论文全文的结构化表示。"""
+    """结构化后的论文全文。"""
+
     arxiv_id: str
     pdf_path: str
-    raw_text: str                            # 全文原始文本
+    raw_text: str
     num_pages: int = 0
-    sections: Dict[str, str] = field(default_factory=dict)  # section_name -> text
+    sections: Dict[str, str] = field(default_factory=dict)
     num_chars: int = 0
 
 
@@ -32,19 +31,14 @@ class PaperFetcher:
     """
     arXiv PDF 下载与全文提取。
 
-    使用方式:
-        fetcher = PaperFetcher(cache_dir=Path("workspace/pdf_cache"))
-        fulltext = fetcher.fetch_fulltext("2301.00234")
-        print(fulltext.sections.get("introduction"))
+    也支持从本地 PDF 直接提取文本。
     """
 
-    # arXiv 可接受的标准 PDF URL 格式
     PDF_URL_TEMPLATES = [
         "https://arxiv.org/pdf/{id}.pdf",
         "https://arxiv.org/pdf/{id}",
     ]
 
-    # 章节识别（按常见学术论文结构）
     SECTION_PATTERNS = [
         (r"\babstract\b", "abstract"),
         (r"\bintroduction\b|\b1\s*introduction\b", "introduction"),
@@ -61,12 +55,8 @@ class PaperFetcher:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.timeout = timeout
 
-    # ------------------------------------------------------------------ #
-    # 公开接口
-    # ------------------------------------------------------------------ #
-
     def fetch_fulltext(self, arxiv_id: str) -> Optional[PaperFullText]:
-        """下载 PDF 并提取全文，失败返回 None。"""
+        """下载 arXiv PDF 并提取全文。"""
         arxiv_id = self._normalize_id(arxiv_id)
         if not arxiv_id:
             return None
@@ -75,34 +65,45 @@ class PaperFetcher:
         if pdf_path is None:
             return None
 
-        try:
-            raw_text, num_pages = self._extract_text(pdf_path)
-        except Exception as e:
-            print(f"[PaperFetcher] text extraction failed: {e}")
+        return self._build_fulltext_from_pdf(pdf_path, paper_id=arxiv_id)
+
+    def fetch_local_fulltext(
+        self,
+        pdf_path: Union[str, Path],
+        paper_id: Optional[str] = None,
+    ) -> Optional[PaperFullText]:
+        """从本地 PDF 文件提取全文。"""
+        path = Path(pdf_path).expanduser()
+        if not path.exists() or not path.is_file():
+            return None
+        if path.suffix.lower() != ".pdf":
             return None
 
-        sections = self._split_sections(raw_text)
+        local_id = paper_id or path.stem
+        return self._build_fulltext_from_pdf(path.resolve(), paper_id=local_id)
 
-        return PaperFullText(
-            arxiv_id=arxiv_id,
-            pdf_path=str(pdf_path),
-            raw_text=raw_text,
-            num_pages=num_pages,
-            sections=sections,
-            num_chars=len(raw_text),
-        )
+    def infer_title_from_pdf(self, pdf_path: Union[str, Path]) -> str:
+        """优先从 PDF metadata 推断标题，失败时回退到文件名。"""
+        path = Path(pdf_path).expanduser()
+        fallback = path.stem
+        if not path.exists():
+            return fallback
 
-    # ------------------------------------------------------------------ #
-    # 内部工具
-    # ------------------------------------------------------------------ #
+        try:
+            import fitz  # PyMuPDF
+
+            with fitz.open(str(path)) as doc:
+                title = (doc.metadata or {}).get("title", "")
+            title = (title or "").strip()
+            return title or fallback
+        except Exception:
+            return fallback
 
     @staticmethod
     def _normalize_id(arxiv_id: str) -> str:
-        """从 URL / 各种输入中提取 arXiv ID。"""
         arxiv_id = (arxiv_id or "").strip()
         if not arxiv_id:
             return ""
-        # 允许传入完整 URL 或带版本号 (如 2301.00234v2)
         if "/" in arxiv_id:
             arxiv_id = arxiv_id.rstrip("/").split("/")[-1]
         if arxiv_id.endswith(".pdf"):
@@ -110,7 +111,6 @@ class PaperFetcher:
         return arxiv_id
 
     def _download_pdf(self, arxiv_id: str) -> Optional[Path]:
-        """下载 PDF（有缓存），返回本地路径。"""
         cache_file = self.cache_dir / f"{arxiv_id}.pdf"
         if cache_file.exists() and cache_file.stat().st_size > 0:
             return cache_file
@@ -137,11 +137,11 @@ class PaperFetcher:
                 except Exception as e:
                     last_err = str(e)[:120]
                     time.sleep(1)
+
         print(f"[PaperFetcher] download failed for {arxiv_id}: {last_err}")
         return None
 
     def _extract_text(self, pdf_path: Path) -> tuple:
-        """用 PyMuPDF 提取全文。"""
         import fitz  # PyMuPDF
 
         text_parts: List[str] = []
@@ -151,15 +151,10 @@ class PaperFetcher:
                 text_parts.append(page.get_text("text"))
 
         raw_text = "\n".join(text_parts)
-        # 合并被 PDF 换行打断的词
         raw_text = re.sub(r"-\n(\w)", r"\1", raw_text)
         return raw_text, num_pages
 
     def _split_sections(self, text: str) -> Dict[str, str]:
-        """
-        按常见章节标题粗分 section。
-        识别不到就返回空 dict（调用方可用 raw_text 兜底）。
-        """
         lines = text.split("\n")
         sections: Dict[str, str] = {}
         current_key: Optional[str] = None
@@ -168,7 +163,6 @@ class PaperFetcher:
         for line in lines:
             clean = line.strip().lower()
             matched_key = None
-            # 章节标题往往是独立一行的短文本
             if 2 <= len(clean) <= 60:
                 for pat, key in self.SECTION_PATTERNS:
                     if re.search(pat, clean):
@@ -180,12 +174,27 @@ class PaperFetcher:
                     sections[current_key] = "\n".join(current_buf).strip()
                 current_key = matched_key
                 current_buf = []
-            else:
-                if current_key:
-                    current_buf.append(line)
+            elif current_key:
+                current_buf.append(line)
 
         if current_key and current_buf:
             sections[current_key] = "\n".join(current_buf).strip()
 
-        # 合并同一章节的多次出现（比如 method 被分了两次）
         return sections
+
+    def _build_fulltext_from_pdf(self, pdf_path: Path, paper_id: str) -> Optional[PaperFullText]:
+        try:
+            raw_text, num_pages = self._extract_text(pdf_path)
+        except Exception as e:
+            print(f"[PaperFetcher] text extraction failed: {e}")
+            return None
+
+        sections = self._split_sections(raw_text)
+        return PaperFullText(
+            arxiv_id=paper_id,
+            pdf_path=str(pdf_path),
+            raw_text=raw_text,
+            num_pages=num_pages,
+            sections=sections,
+            num_chars=len(raw_text),
+        )

@@ -195,6 +195,57 @@ class MemoryManager:
         reranked = self.reranker.rerank(query, candidates, top_k=top_k)
         return [c.raw for c in reranked]
 
+    def get_recent_episodes(self, limit: int = 5) -> list:
+        """返回最近的研究情节记忆。"""
+        return self.episodic.get_recent(limit=limit)
+
+    def get_relevant_skills(self, query: str, limit: int = 5) -> list:
+        """返回与查询相关的技能记忆。"""
+        return self.skill.find_relevant(query, limit=limit)
+
+    def find_paper_notes(self, query: str, top_k: int = 5) -> List[Dict[str, str]]:
+        """在 workspace/paper_notes 中按文件名和内容粗搜已有论文笔记。"""
+        notes_dir = self.vector.persist_dir.parent / "paper_notes"
+        if not notes_dir.exists():
+            return []
+
+        query_lower = (query or "").lower().strip()
+        matches: List[Dict[str, str]] = []
+        for path in sorted(notes_dir.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True):
+            try:
+                content = path.read_text(encoding="utf-8")
+            except Exception:
+                continue
+
+            if query_lower:
+                title_match = query_lower in path.stem.lower()
+                content_match = query_lower in content.lower()
+                if not (title_match or content_match):
+                    continue
+
+            matches.append({
+                "title": path.stem,
+                "path": str(path),
+                "preview": content[:1200],
+            })
+            if len(matches) >= top_k:
+                break
+
+        if matches or query_lower:
+            return matches
+
+        for path in sorted(notes_dir.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)[:top_k]:
+            try:
+                content = path.read_text(encoding="utf-8")
+            except Exception:
+                continue
+            matches.append({
+                "title": path.stem,
+                "path": str(path),
+                "preview": content[:1200],
+            })
+        return matches
+
     # ------------------------------------------------------------------ #
     # 向量命中回查与跨源去重
     # ------------------------------------------------------------------ #

@@ -111,7 +111,7 @@ def build_analyze_paper_tool(
         description=(
             "Deeply analyze one paper (downloads full text, does section-level map-reduce). "
             "Produces a structured note following paper-reader quality standards: "
-            "TL;DR, contributions, method with [[Concept]] links, formulas with symbol legends, "
+            "TL;DR, contributions, method summary, formulas with symbol legends, "
             "datasets, results with numbers, critical view, reproducibility checklist. "
             "Also saves the note to workspace/paper_notes/ and indexes it in vector store. "
             "Use sparingly on the 2-3 most important papers."

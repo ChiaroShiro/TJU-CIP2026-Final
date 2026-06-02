@@ -151,6 +151,18 @@ python main.py search "reinforcement learning for LLM reasoning"
 python main.py analyze "2301.00234" --focus "方法论"
 ```
 
+也可以直接阅读本地 PDF：
+
+```bash
+python main.py read-paper "D:\path\to\paper.pdf" --focus "方法论"
+```
+
+如果 PDF metadata 里的标题不准，可以手动指定：
+
+```bash
+python main.py read-paper "D:\path\to\paper.pdf" --title "Direct Preference Optimization" --focus "实验设计"
+```
+
 **输出包含**：
 - 核心问题
 - 主要贡献
@@ -383,7 +395,6 @@ registry.register(my_tool)
   - 公式 5 类必检规范（变量冲突 / 文本-公式不一致 / 符号约定不一致 / 求和范围错 / 缺算子）
   - URL 规范化（防止 arxiv_id 路径重复 bug）
   - 图片可达性检查 + 选择性本地化（不可达自动下载到 `assets/`）
-  - 概念库自动维护（`[[Concept]]` 链接对应独立概念笔记）
   - 笔记模板结构（YAML frontmatter + 一句话总结 + 核心贡献 + 方法详解 + 关键公式 + 关键图表 + 批判性思考 + 速查卡片）
 
 ---
