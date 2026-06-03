@@ -1,59 +1,41 @@
-"""
-记忆管理器（Memory Manager）- Hermes风格三层记忆统一接口
-
-三层架构：
-  Layer 1 - Session Memory  : ContextManager（内存，当前会话对话历史）
-  Layer 2 - Episodic Memory : SQLite+FTS5（跨会话，历史研究情节）
-  Layer 3 - Skill Memory    : SQLite+FTS5（跨会话，学到的研究技能）
-  + Vector Store            : Chroma（语义检索，跨所有内容）
-
-检索流程：
-  召回阶段（Recall） - 每路扩大召回，取较多候选
-  精排阶段（Rerank） - Cross-Encoder 对所有候选统一重排
-  输出阶段         - 按 source 回填到各个分类，或输出统一 top_k
-"""
-
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from ..core.config import Settings
 from ..core.context_manager import ContextManager
 from ..core.models import MemoryHit
-from .episodic_memory import Episode, EpisodicMemory
+from .episodic_memory import EpisodicMemory
+from .paper_graph import PaperGraphMemory
 from .reranker import CrossEncoderReranker, RerankCandidate, build_candidates_from_memory
-from .skill_memory import Skill, SkillMemory
+from .skill_memory import SkillMemory
 from .vector_store import VectorMemory
 
 
 class MemoryManager:
     """
-    三层记忆管理器，统一管理 Session / Episodic / Skill 三层记忆。
-
-    使用方式：
-        ctx = memory.get_context_for_task("transformer attention mechanism")
-        prompt_ctx = memory.format_context_for_prompt("transformer attention mechanism")
+    Unified memory manager for:
+    - session memory
+    - episodic memory
+    - skill memory
+    - vector memory
+    - paper graph memory
     """
 
-    # 召回阶段的扩大倍数（召回更多再让 reranker 精排）
     RECALL_MULTIPLIER = 4
+    MIN_RELATED_PAPER_CONFIDENCE = 0.45
+    MIN_GRAPH_CONTEXT_CONFIDENCE = 0.58
+    MIN_EDGE_CONFIDENCE = 0.60
 
     def __init__(self, settings: Settings, enable_rerank: Optional[bool] = None):
         mem_dir = settings.workspace_dir / "memory"
         mem_dir.mkdir(parents=True, exist_ok=True)
 
-        # Layer 1: 会话记忆（内存）
         self.session = ContextManager(settings.context_max_chars)
-
-        # Layer 2: 情节记忆（SQLite + FTS5）
         self.episodic = EpisodicMemory(mem_dir / "episodic.db")
-
-        # Layer 3: 技能记忆（SQLite + FTS5）
         self.skill = SkillMemory(mem_dir / "skills.db")
-
-        # 语义向量存储（Chroma）
+        self.paper_graph = PaperGraphMemory(mem_dir / "paper_graph.db")
         self.vector = VectorMemory(settings.workspace_dir / "vector_db")
 
-        # Cross-Encoder 精排器（懒加载）
         self.enable_rerank = (
             settings.enable_rerank if enable_rerank is None else enable_rerank
         )
@@ -67,48 +49,16 @@ class MemoryManager:
         self._top_k = settings.memory_top_k
         self._ep_k = settings.memory_episode_k
         self._sk_k = settings.memory_skill_k
-
-        # 技能使用追踪：最近一次 get_context_for_task 返回的技能 id 列表
-        # 研究完成后 ReflectionEngine 会按质量反馈成功与否
         self._last_used_skill_ids: List[str] = []
 
-    # ------------------------------------------------------------------ #
-    # 查询接口
-    # ------------------------------------------------------------------ #
-
     def get_context_for_task(self, query: str) -> Dict[str, Any]:
-        """
-        同时查询所有记忆层，返回结构化上下文。
-
-        流程：
-          1. 每路以 RECALL_MULTIPLIER 扩大召回
-          2. 统一成 RerankCandidate 列表
-          3. Cross-Encoder 精排
-          4. 按 source 回填，返回最终 top_k
-
-        Returns:
-            {
-              "session":  session messages,
-              "episodes": List[Episode],   # 精排后保留的
-              "skills":   List[Skill],
-              "vectors":  List[MemoryHit],
-              "reranked": List[RerankCandidate],  # 统一精排 top_k（可直接给 LM）
-            }
-        """
         recall_k = self._top_k * self.RECALL_MULTIPLIER
 
-        # 1. 扩大召回
         episodes = self.episodic.search(query, limit=recall_k)
         skills = self.skill.find_relevant(query, limit=recall_k)
         vectors = self.vector.retrieve(query, recall_k)
-
-        # 1.5 向量命中回查 + 跨源去重
-        # 向量库里的 doc_id 形如 "episode:xxx" / "skill:xxx" / "task:xxx" / "direction:xxx"
-        # 对前两种做回查得到完整对象，合并进 episodes/skills 列表（去重）；
-        # 其余（task/direction 等）保留为纯向量命中。
         episodes, skills, vectors = self._resolve_vector_hits(episodes, skills, vectors)
 
-        # 2. 如果未启用 rerank，走原路径
         if not self.enable_rerank or self.reranker is None:
             sk_returned = skills[:self._sk_k]
             self._last_used_skill_ids = [s.id for s in sk_returned]
@@ -120,18 +70,13 @@ class MemoryManager:
                 "reranked": [],
             }
 
-        # 3. 构建统一候选并精排
         candidates = build_candidates_from_memory(episodes, skills, vectors)
-        # 给下游三路分流留足空间：ep_k + sk_k + top_k
         rerank_output_k = self._ep_k + self._sk_k + self._top_k
         reranked = self.reranker.rerank(query, candidates, top_k=rerank_output_k)
 
-        # 4. 按 source 回填
         ep_reranked = [c.raw for c in reranked if c.source == "episode"][:self._ep_k]
         sk_reranked = [c.raw for c in reranked if c.source == "skill"][:self._sk_k]
         vec_reranked = [c.raw for c in reranked if c.source == "vector"][:self._top_k]
-
-        # 记录本轮精排后实际要注入的技能 id
         self._last_used_skill_ids = [s.id for s in sk_reranked]
 
         return {
@@ -143,25 +88,23 @@ class MemoryManager:
         }
 
     def format_context_for_prompt(self, query: str) -> str:
-        """将所有记忆层的相关内容格式化为可注入提示词的字符串。"""
         ctx = self.get_context_for_task(query)
+        graph_ctx = self.get_paper_graph_context(query, top_k=4)
         parts: List[str] = []
 
         if ctx["episodes"]:
             parts.append("### 历史研究情节")
             for ep in ctx["episodes"]:
                 parts.append(
-                    f"**主题:** {ep.topic}  (质量: {ep.quality_score:.2f})\n"
+                    f"**主题:** {ep.topic} (质量: {ep.quality_score:.2f})\n"
                     f"**洞见:** {ep.insights}"
                 )
 
         if ctx["skills"]:
-            parts.append("### 已学研究技能（按 skill-creator 范式组织）")
+            parts.append("### 已学研究技能")
             for sk in ctx["skills"]:
-                # 先给 planner 看 description（最精炼） + trigger（判断是否匹配）
-                # 再附 content 前 800 字符（完整 procedure 的头部，够用）
                 head = (
-                    f"**{sk.name}** [{sk.domain}]  "
+                    f"**{sk.name}** [{sk.domain}] "
                     f"(使用 {sk.usage_count} 次, 成功率 {sk.success_rate:.2f})\n"
                     f"_说明_: {sk.description}\n"
                     f"_触发_: {sk.trigger_conditions}"
@@ -171,6 +114,15 @@ class MemoryManager:
                     body += "\n...(truncated)"
                 parts.append(f"{head}\n\n{body}")
 
+        if graph_ctx["papers"]:
+            parts.append("### 已读论文图记忆")
+            for paper in graph_ctx["papers"]:
+                parts.append(
+                    f"**{paper.get('title', '')}**\n"
+                    f"- 核心: {paper.get('tldr', '')}\n"
+                    f"- 问题: {paper.get('problem', '')}"
+                )
+
         if ctx["vectors"]:
             parts.append("### 语义记忆片段")
             for hit in ctx["vectors"]:
@@ -178,8 +130,7 @@ class MemoryManager:
 
         return "\n\n".join(parts) if parts else ""
 
-    def get_related_papers(self, query: str, top_k: int = 5) -> list:
-        """只检索论文笔记（doc_id 前缀 'paper:'），不混入 episode/skill。"""
+    def get_related_papers(self, query: str, top_k: int = 5) -> List[MemoryHit]:
         hits = self.vector.retrieve(query, top_k * 4)
         paper_hits = [h for h in hits if (h.doc_id or "").startswith("paper:")]
 
@@ -188,7 +139,10 @@ class MemoryManager:
 
         candidates = [
             RerankCandidate(
-                doc_id=h.doc_id, content=h.content, source="paper", raw=h,
+                doc_id=h.doc_id,
+                content=h.content,
+                source="paper",
+                raw=h,
             )
             for h in paper_hits
         ]
@@ -196,15 +150,12 @@ class MemoryManager:
         return [c.raw for c in reranked]
 
     def get_recent_episodes(self, limit: int = 5) -> list:
-        """返回最近的研究情节记忆。"""
         return self.episodic.get_recent(limit=limit)
 
     def get_relevant_skills(self, query: str, limit: int = 5) -> list:
-        """返回与查询相关的技能记忆。"""
         return self.skill.find_relevant(query, limit=limit)
 
     def find_paper_notes(self, query: str, top_k: int = 5) -> List[Dict[str, str]]:
-        """在 workspace/paper_notes 中按文件名和内容粗搜已有论文笔记。"""
         notes_dir = self.vector.persist_dir.parent / "paper_notes"
         if not notes_dir.exists():
             return []
@@ -223,11 +174,13 @@ class MemoryManager:
                 if not (title_match or content_match):
                     continue
 
-            matches.append({
-                "title": path.stem,
-                "path": str(path),
-                "preview": content[:1200],
-            })
+            matches.append(
+                {
+                    "title": path.stem,
+                    "path": str(path),
+                    "preview": content[:1200],
+                }
+            )
             if len(matches) >= top_k:
                 break
 
@@ -239,28 +192,180 @@ class MemoryManager:
                 content = path.read_text(encoding="utf-8")
             except Exception:
                 continue
-            matches.append({
-                "title": path.stem,
-                "path": str(path),
-                "preview": content[:1200],
-            })
+            matches.append(
+                {
+                    "title": path.stem,
+                    "path": str(path),
+                    "preview": content[:1200],
+                }
+            )
         return matches
 
-    # ------------------------------------------------------------------ #
-    # 向量命中回查与跨源去重
-    # ------------------------------------------------------------------ #
+    def get_related_read_papers(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+        graph_hits = self.paper_graph.search_papers(query, limit=top_k)
+        vector_hits = self.get_related_papers(query, top_k=top_k * 2)
+
+        merged: List[Dict[str, Any]] = []
+        seen = set()
+
+        for node in graph_hits:
+            seen.add(node.paper_id)
+            confidence = self._compute_graph_match_confidence(node, query)
+            merged.append(
+                {
+                    "paper_id": node.paper_id,
+                    "title": node.title,
+                    "method_name": node.method_name,
+                    "problem": node.problem,
+                    "tldr": node.tldr,
+                    "note_path": node.note_path,
+                    "source": "graph",
+                    "confidence": round(confidence, 3),
+                    "is_placeholder": bool((node.metadata or {}).get("placeholder")),
+                }
+            )
+
+        for hit in vector_hits:
+            metadata = hit.metadata or {}
+            paper_id = metadata.get("paper_id") or metadata.get("arxiv_id") or hit.doc_id.replace("paper:", "", 1)
+            if paper_id in seen:
+                continue
+            seen.add(paper_id)
+            confidence = self._compute_vector_match_confidence(hit, query)
+            merged.append(
+                {
+                    "paper_id": paper_id,
+                    "title": metadata.get("title") or metadata.get("method_name") or paper_id,
+                    "method_name": metadata.get("method_name", ""),
+                    "problem": metadata.get("problem", ""),
+                    "tldr": hit.content[:300],
+                    "note_path": metadata.get("path", ""),
+                    "source": "vector",
+                    "confidence": round(confidence, 3),
+                    "is_placeholder": False,
+                }
+            )
+            if len(merged) >= top_k:
+                break
+
+        merged.sort(key=lambda item: item.get("confidence", 0.0), reverse=True)
+        return merged[:top_k]
+
+    def get_paper_graph_context(self, query: str, top_k: int = 5) -> Dict[str, Any]:
+        papers = self.get_related_read_papers(query, top_k=top_k)
+        qualified_papers = [
+            item for item in papers
+            if item.get("confidence", 0.0) >= self.MIN_RELATED_PAPER_CONFIDENCE
+            and not item.get("is_placeholder", False)
+        ]
+
+        edges = []
+        for item in qualified_papers[:3]:
+            paper_id = item.get("paper_id", "")
+            if not paper_id:
+                continue
+            neighbors = self.paper_graph.get_neighbors(paper_id, limit=6)
+            for edge in neighbors:
+                edge_confidence = self._compute_edge_confidence(edge.relation_strength, item.get("confidence", 0.0))
+                edges.append(
+                    {
+                        "src_paper_id": edge.src_paper_id,
+                        "dst_paper_id": edge.dst_paper_id,
+                        "relation_type": edge.relation_type,
+                        "relation_strength": edge.relation_strength,
+                        "evidence": edge.evidence,
+                        "source_kind": edge.source_kind,
+                        "confidence": round(edge_confidence, 3),
+                    }
+                )
+
+        qualified_edges = [
+            edge for edge in edges
+            if edge.get("confidence", 0.0) >= self.MIN_EDGE_CONFIDENCE
+        ]
+
+        top_confidences = [item["confidence"] for item in qualified_papers[:3]]
+        if qualified_edges:
+            top_confidences.extend(edge["confidence"] for edge in qualified_edges[:3])
+        aggregate_confidence = (
+            round(sum(top_confidences) / len(top_confidences), 3)
+            if top_confidences else 0.0
+        )
+        has_confident_context = (
+            bool(qualified_papers)
+            and aggregate_confidence >= self.MIN_GRAPH_CONTEXT_CONFIDENCE
+        )
+
+        return {
+            "papers": qualified_papers[:top_k] if has_confident_context else [],
+            "edges": qualified_edges[:12] if has_confident_context else [],
+            "node_count": self.paper_graph.count_nodes(),
+            "edge_count": self.paper_graph.count_edges(),
+            "aggregate_confidence": aggregate_confidence,
+            "has_confident_context": has_confident_context,
+        }
+
+    def _compute_graph_match_confidence(self, node, query: str) -> float:
+        query_lower = (query or "").strip().lower()
+        if not query_lower:
+            return 0.0
+
+        title = (node.title or "").lower()
+        method_name = (node.method_name or "").lower()
+        problem = (node.problem or "").lower()
+        tldr = (node.tldr or "").lower()
+        tags = " ".join(node.tags or []).lower()
+        metadata = node.metadata or {}
+
+        confidence = 0.35
+        if query_lower == title or query_lower == method_name:
+            confidence = 0.95
+        elif query_lower in title or query_lower in method_name:
+            confidence = 0.82
+        elif query_lower in problem:
+            confidence = 0.68
+        elif query_lower in tldr:
+            confidence = 0.60
+        elif query_lower in tags:
+            confidence = 0.55
+
+        if metadata.get("placeholder"):
+            confidence -= 0.35
+        if not node.note_path:
+            confidence -= 0.10
+        if not node.problem and not node.tldr:
+            confidence -= 0.10
+        return max(0.0, min(confidence, 1.0))
+
+    def _compute_vector_match_confidence(self, hit: MemoryHit, query: str) -> float:
+        query_lower = (query or "").strip().lower()
+        metadata = hit.metadata or {}
+        title = str(metadata.get("title", "")).lower()
+        method_name = str(metadata.get("method_name", "")).lower()
+        problem = str(metadata.get("problem", "")).lower()
+        content = (hit.content or "").lower()
+
+        confidence = float(hit.score or 0.0)
+        if query_lower and (query_lower == title or query_lower == method_name):
+            confidence = max(confidence, 0.92)
+        elif query_lower and (query_lower in title or query_lower in method_name):
+            confidence = max(confidence, 0.80)
+        elif query_lower and query_lower in problem:
+            confidence = max(confidence, 0.66)
+        elif query_lower and query_lower in content:
+            confidence = max(confidence, 0.52)
+
+        if not metadata.get("path"):
+            confidence -= 0.08
+        return max(0.0, min(confidence, 1.0))
+
+    @staticmethod
+    def _compute_edge_confidence(relation_strength: float, paper_confidence: float) -> float:
+        relation_strength = float(relation_strength or 0.0)
+        paper_confidence = float(paper_confidence or 0.0)
+        return max(0.0, min((relation_strength * 0.6) + (paper_confidence * 0.4), 1.0))
 
     def _resolve_vector_hits(self, episodes, skills, vectors):
-        """
-        处理向量库命中，让结果按"真实身份"归类：
-          - 前缀 "episode:" → 回查 EpisodicMemory，合并进 episodes（已在情节列表中的跳过）
-          - 前缀 "skill:"   → 回查 SkillMemory，合并进 skills
-          - 其他前缀（task:/direction: 等）→ 保留为纯向量命中
-
-        这样做的好处：
-          1. 向量命中能拿到结构化完整字段（Episode.content/tags，Skill.trigger 等）
-          2. Rerank 阶段按 doc_id 去重时，同一条 episode 只保留一份
-        """
         ep_ids = {e.id for e in episodes}
         sk_ids = {s.id for s in skills}
         remaining_vectors = []
@@ -271,12 +376,11 @@ class MemoryManager:
             if doc_id.startswith("episode:"):
                 ep_id = doc_id.split(":", 1)[1]
                 if ep_id in ep_ids:
-                    continue  # 情节库已召回，无需重复
+                    continue
                 ep = self.episodic.get_by_id(ep_id)
                 if ep is not None:
                     episodes.append(ep)
                     ep_ids.add(ep_id)
-                # 回查失败时也不保留纯向量（避免只有缩略）
                 continue
 
             if doc_id.startswith("skill:"):
@@ -293,13 +397,108 @@ class MemoryManager:
 
         return episodes, skills, remaining_vectors
 
-    # ------------------------------------------------------------------ #
-    # 写入接口
-    # ------------------------------------------------------------------ #
-
     def save_task_result(self, doc_id: str, title: str, body: str):
-        """将单个任务结果存入向量存储。"""
         self.vector.add(doc_id, body, {"title": title})
+
+    def save_paper_note(self, paper_id: str, title: str, analysis: Dict[str, Any]) -> None:
+        tags = analysis.get("tags", []) or []
+        contributions = analysis.get("contributions", []) or []
+        datasets_raw = analysis.get("datasets", []) or []
+        datasets = []
+        for item in datasets_raw:
+            if isinstance(item, str):
+                datasets.append(item)
+            elif isinstance(item, dict):
+                datasets.append(item.get("name", "") or "Unknown")
+
+        summary_text = (
+            f"{title}\n"
+            f"{analysis.get('tldr', '')}\n\n"
+            f"Problem:\n{analysis.get('problem', '')}\n\n"
+            f"Method:\n{analysis.get('method_summary', '')[:1200]}\n\n"
+            "Contributions:\n"
+            + "\n".join(f"- {c}" for c in contributions)
+        )
+
+        self.vector.add(
+            doc_id=f"paper:{paper_id}",
+            content=summary_text,
+            metadata={
+                "type": "paper_note",
+                "paper_id": paper_id,
+                "arxiv_id": paper_id,
+                "title": title,
+                "method_name": analysis.get("_method_name", ""),
+                "path": analysis.get("_note_path", ""),
+                "tags": ",".join(tags),
+                "problem": analysis.get("problem", ""),
+            },
+        )
+
+        self.paper_graph.upsert_paper(
+            paper_id=paper_id,
+            title=title,
+            method_name=analysis.get("_method_name", ""),
+            note_path=analysis.get("_note_path", ""),
+            problem=analysis.get("problem", ""),
+            method_summary=analysis.get("method_summary", ""),
+            tldr=analysis.get("tldr", ""),
+            tags=tags,
+            datasets=datasets,
+            related_work=analysis.get("related_work", []) or [],
+            metadata={
+                "analysis_mode": analysis.get("_analysis_mode", ""),
+                "source": analysis.get("_source", ""),
+                "focus": analysis.get("_focus", ""),
+            },
+        )
+
+        for item in analysis.get("cited_similar_work", []) or []:
+            if isinstance(item, str):
+                title_text = item.strip()
+                if not title_text:
+                    continue
+                target_id = title_text[:120]
+                relation_type = "similar_to"
+                evidence = ""
+                source_kind = "inferred"
+            elif isinstance(item, dict):
+                title_text = str(item.get("title", "")).strip()
+                if not title_text:
+                    continue
+                target_id = title_text[:120]
+                category = (item.get("category", "") or "").lower()
+                if "foundation" in category:
+                    relation_type = "builds_on"
+                elif "baseline" in category:
+                    relation_type = "compares_with"
+                else:
+                    relation_type = "similar_to"
+                evidence = (
+                    str(item.get("why_related", "")).strip()
+                    or str(item.get("difference_vs_this_paper", "")).strip()
+                )
+                source_kind = "explicit"
+            else:
+                continue
+
+            existing = self.paper_graph.search_papers(title_text, limit=1)
+            dst_paper_id = existing[0].paper_id if existing else target_id
+            if not existing:
+                self.paper_graph.upsert_paper(
+                    paper_id=dst_paper_id,
+                    title=title_text,
+                    metadata={"placeholder": True},
+                )
+
+            self.paper_graph.add_edge(
+                src_paper_id=paper_id,
+                dst_paper_id=dst_paper_id,
+                relation_type=relation_type,
+                relation_strength=0.75,
+                evidence=evidence[:500],
+                source_kind=source_kind,
+            )
 
     def save_research_episode(
         self,
@@ -309,7 +508,6 @@ class MemoryManager:
         tags: List[str],
         quality_score: float,
     ) -> str:
-        """将完整研究会话存入情节记忆 + 向量存储。"""
         ep_id = self.episodic.add_episode(
             topic=topic,
             content=content,
@@ -332,7 +530,6 @@ class MemoryManager:
         content: str,
         domain: str = "general",
     ) -> str:
-        """将学到的技能存入技能记忆 + 镜像到向量库（支持语义检索）。"""
         skill_id = self.skill.add_skill(
             name=name,
             description=description,
@@ -340,9 +537,6 @@ class MemoryManager:
             content=content,
             domain=domain,
         )
-        # 镜像到向量库：description + trigger + content
-        # description 首当其冲（它本身就是 discoverability 设计）
-        # content 可能很长，截断到 1500 字符避免过度占用向量空间
         payload = f"{description}\n触发: {trigger_conditions}\n{content[:1500]}"
         self.vector.add(
             f"skill:{skill_id}",
@@ -352,14 +546,6 @@ class MemoryManager:
         return skill_id
 
     def feedback_skills_usage(self, success: bool) -> int:
-        """
-        对最近一次 get_context_for_task 返回的技能做使用反馈。
-
-        通常由 ReflectionEngine 在研究完成后按质量阈值调用：
-            memory.feedback_skills_usage(success=quality_score >= 0.7)
-
-        返回：实际被反馈的技能数量。
-        """
         count = 0
         for sk_id in self._last_used_skill_ids:
             try:
@@ -367,16 +553,14 @@ class MemoryManager:
                 count += 1
             except Exception:
                 continue
-        self._last_used_skill_ids = []  # 反馈完清空，避免重复计数
+        self._last_used_skill_ids = []
         return count
-
-    # ------------------------------------------------------------------ #
-    # 统计
-    # ------------------------------------------------------------------ #
 
     def stats(self) -> Dict[str, int]:
         return {
             "episodes": self.episodic.count(),
             "skills": self.skill.count(),
             "vectors": self.vector.count(),
+            "paper_nodes": self.paper_graph.count_nodes(),
+            "paper_edges": self.paper_graph.count_edges(),
         }

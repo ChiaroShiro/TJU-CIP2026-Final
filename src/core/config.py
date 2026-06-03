@@ -8,6 +8,9 @@ class Settings:
     llm_model: str
     llm_api_key: str
     llm_base_url: str
+    vision_model: str
+    vision_api_key: str
+    vision_base_url: str
     planner_temperature: float = 0.2
     researcher_temperature: float = 0.3
     writer_temperature: float = 0.2
@@ -33,12 +36,18 @@ class Settings:
         llm_api_key = os.getenv("LLM_API_KEY", "").strip()
         llm_base_url = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1").strip()
         llm_model = os.getenv("LLM_MODEL_ID", "gpt-4o-mini").strip()
+        vision_api_key = os.getenv("VISION_API_KEY", llm_api_key).strip()
+        vision_base_url = os.getenv("VISION_BASE_URL", llm_base_url).strip()
+        vision_model = os.getenv("VISION_MODEL_ID", llm_model).strip()
         workspace = project_root / os.getenv("RESEARCH_WORKSPACE_DIR", "workspace")
 
         return cls(
             llm_model=llm_model,
             llm_api_key=llm_api_key,
             llm_base_url=llm_base_url,
+            vision_model=vision_model,
+            vision_api_key=vision_api_key,
+            vision_base_url=vision_base_url,
             planner_temperature=float(os.getenv("PLANNER_TEMPERATURE", "0.2")),
             researcher_temperature=float(os.getenv("RESEARCHER_TEMPERATURE", "0.3")),
             writer_temperature=float(os.getenv("WRITER_TEMPERATURE", "0.2")),
@@ -59,4 +68,3 @@ class Settings:
             rerank_score_threshold=float(os.getenv("RERANK_SCORE_THRESHOLD", "0.3")),
             workspace_dir=workspace,
         )
-

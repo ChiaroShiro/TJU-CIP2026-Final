@@ -2,8 +2,8 @@
 from datetime import datetime
 from pathlib import Path
 
-from dotenv import load_dotenv
 import typer
+from dotenv import load_dotenv
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Prompt
@@ -54,6 +54,80 @@ def _format_module_brief(module) -> str:
     return f"{name}: {details}" if details else name
 
 
+def _print_analysis_result(title: str, result: dict, local: bool = False):
+    console.print(Panel(f"[bold]{title}[/bold]"))
+    source = result.get("_source", "unknown")
+    if source in {"fulltext", "local_pdf"}:
+        label = "本地 PDF" if local else "全文 PDF"
+        console.print(
+            f"[dim]分析来源: {label} ({result.get('_num_pages', '?')} 页, "
+            f"{result.get('_num_chunks', '?')} 个章节块)[/dim]"
+        )
+    else:
+        console.print("[yellow]分析来源: 仅摘要（全文不可用，已自动降级）[/yellow]")
+
+    mode = result.get("_analysis_mode")
+    if mode == "multimodal":
+        console.print("[dim]分析模式: 多模态细读版[/dim]")
+    elif mode == "conservative":
+        console.print("[dim]分析模式: 保守版[/dim]")
+
+    console.print(f"\n[bold]核心问题:[/bold] {result.get('problem', '')}")
+
+    contributions = result.get("contributions", [])
+    if contributions:
+        console.print("\n[bold]主要贡献:[/bold]")
+        for item in contributions:
+            console.print(f"  • {item}")
+
+    method_summary = result.get("method_summary", "")
+    modules = result.get("modules", [])
+    if method_summary or modules:
+        console.print("\n[bold]方法:[/bold]")
+        if method_summary:
+            console.print(method_summary)
+        for module in modules[:5]:
+            console.print(f"  • {_format_module_brief(module)}")
+
+    datasets = result.get("datasets", [])
+    if datasets:
+        console.print("\n[bold]数据集:[/bold]")
+        for dataset in datasets:
+            console.print(f"  • {_format_dataset_brief(dataset)}")
+
+    cited_similar_work = result.get("cited_similar_work", [])
+    if cited_similar_work:
+        console.print("\n[bold]引用中的相似工作:[/bold]")
+        for item in cited_similar_work[:5]:
+            if isinstance(item, str):
+                console.print(f"  • {item}")
+                continue
+            title_text = item.get("title", "") or "Unknown"
+            category = item.get("category", "")
+            why_related = item.get("why_related", "")
+            suffix = f" [{category}]" if category else ""
+            if why_related:
+                console.print(f"  • {title_text}{suffix}: {why_related}")
+            else:
+                console.print(f"  • {title_text}{suffix}")
+
+    if result.get("results"):
+        console.print(f"\n[bold]实验结果:[/bold] {result['results']}")
+
+    weaknesses = result.get("weaknesses", []) or result.get("limitations", [])
+    if weaknesses:
+        console.print("\n[bold]局限性:[/bold]")
+        for item in weaknesses:
+            console.print(f"  • {item}")
+
+    if result.get("future_work"):
+        console.print(f"\n[bold]未来方向:[/bold] {result['future_work']}")
+
+    note_path = result.get("_note_path")
+    if note_path:
+        console.print(f"\n[green]笔记已保存至: {note_path}[/green]")
+
+
 @app.command()
 def evaluate(direction: str = typer.Argument(..., help="研究方向描述")):
     """评估研究方向的可行性和价值。"""
@@ -74,7 +148,7 @@ def evaluate(direction: str = typer.Argument(..., help="研究方向描述")):
 
     papers = result.get("papers", [])
     if papers:
-        console.print(f"\n[bold]找到 {len(papers)} 篇相关论文[/bold]")
+        console.print(f"\n[bold]找到 {len(papers)} 篇相关文章[/bold]")
         for i, paper in enumerate(papers[:5], 1):
             console.print(f"  {i}. {paper.title}")
             console.print(f"     {paper.url}")
@@ -100,10 +174,10 @@ def analyze(
     url: str = typer.Argument(..., help="论文 arXiv ID 或 URL"),
     focus: str = typer.Option(None, "--focus", "-f", help="关注点"),
 ):
-    """深度分析一篇 arXiv 论文。"""
+    """保守版 arXiv 论文分析。调研默认使用这一版。"""
     orch = get_orchestrator()
-
     paper_id = url.rstrip("/").split("/")[-1].replace(".pdf", "")
+
     with console.status("分析论文中..."):
         papers = orch.arxiv.search(f"id:{paper_id}", max_results=1)
         if not papers:
@@ -111,118 +185,55 @@ def analyze(
             raise typer.Exit(1)
         result = orch.analyze_paper(papers[0], focus)
 
-    console.print(Panel(f"[bold]{papers[0].title}[/bold]"))
-    source = result.get("_source", "unknown")
-    if source == "fulltext":
-        console.print(
-            f"[dim]分析来源: 全文 PDF ({result.get('_num_pages', '?')} 页, "
-            f"{result.get('_num_chunks', '?')} 个章节块)[/dim]"
-        )
-    else:
-        console.print("[yellow]分析来源: 仅摘要（全文下载失败，已降级）[/yellow]")
-
-    console.print(f"\n[bold]核心问题:[/bold] {result.get('problem', '')}")
-
-    contributions = result.get("contributions", [])
-    if contributions:
-        console.print("\n[bold]主要贡献:[/bold]")
-        for item in contributions:
-            console.print(f"  • {item}")
-
-    method_summary = result.get("method_summary", "")
-    modules = result.get("modules", [])
-    if method_summary or modules:
-        console.print("\n[bold]方法:[/bold]")
-        if method_summary:
-            console.print(method_summary)
-        for module in modules[:5]:
-            console.print(f"  • {_format_module_brief(module)}")
-
-    datasets = result.get("datasets", [])
-    if datasets:
-        console.print("\n[bold]数据集:[/bold]")
-        for dataset in datasets:
-            console.print(f"  • {_format_dataset_brief(dataset)}")
-
-    if result.get("results"):
-        console.print(f"\n[bold]实验结果:[/bold] {result['results']}")
-
-    weaknesses = result.get("weaknesses", []) or result.get("limitations", [])
-    if weaknesses:
-        console.print("\n[bold]局限性:[/bold]")
-        for item in weaknesses:
-            console.print(f"  • {item}")
-
-    if result.get("future_work"):
-        console.print(f"\n[bold]未来方向:[/bold] {result['future_work']}")
-
-    note_path = result.get("_note_path")
-    if note_path:
-        console.print(f"\n[green]笔记已保存至: {note_path}[/green]")
+    _print_analysis_result(papers[0].title, result, local=False)
 
 
 @app.command("read-paper")
 def read_paper(
-    pdf_path: str = typer.Argument(..., help="本地 PDF 论文路径"),
-    title: str = typer.Option(None, "--title", "-t", help="可选：手动指定论文标题"),
+    source: str = typer.Argument(..., help="本地 PDF 路径，或 arXiv ID / arXiv URL"),
+    title: str = typer.Option(None, "--title", "-t", help="本地 PDF 可选手动指定标题"),
     focus: str = typer.Option(None, "--focus", "-f", help="关注点"),
 ):
-    """直接阅读本地 PDF 论文并生成结构化笔记。"""
-    pdf_file = Path(pdf_path).expanduser().resolve()
-    if not pdf_file.exists() or not pdf_file.is_file():
-        console.print(f"[red]未找到 PDF 文件: {pdf_file}[/red]")
-        raise typer.Exit(1)
-    if pdf_file.suffix.lower() != ".pdf":
-        console.print(f"[red]文件不是 PDF: {pdf_file}[/red]")
-        raise typer.Exit(1)
-
+    """细读论文。arXiv 走多模态细读版，本地 PDF 走保守版。"""
     orch = get_orchestrator()
-    display_title = title or orch.analyzer.fetcher.infer_title_from_pdf(pdf_file)
-    console.print(Panel(f"[bold]本地论文阅读:[/bold] {display_title}", style="blue"))
-    console.print(f"[dim]{pdf_file}[/dim]")
 
-    with console.status("正在解析本地 PDF 并分析..."):
-        result = orch.analyzer.analyze_local_pdf(pdf_file, title=title, focus=focus)
+    possible_file = Path(source).expanduser()
+    if possible_file.exists() and possible_file.is_file():
+        pdf_file = possible_file.resolve()
+        if pdf_file.suffix.lower() != ".pdf":
+            console.print(f"[red]文件不是 PDF: {pdf_file}[/red]")
+            raise typer.Exit(1)
 
-    console.print(Panel(f"[bold]{display_title}[/bold]"))
-    source = result.get("_source", "unknown")
-    if source == "local_pdf":
-        console.print(
-            f"[dim]分析来源: 本地 PDF ({result.get('_num_pages', '?')} 页, "
-            f"{result.get('_num_chunks', '?')} 个章节块)[/dim]"
-        )
-    else:
-        console.print("[yellow]本地 PDF 文本提取不足，已生成降级笔记[/yellow]")
+        display_title = title or orch.analyzer.fetcher.infer_title_from_pdf(pdf_file)
+        console.print(Panel(f"[bold]本地论文阅读（保守版）[/bold] {display_title}", style="blue"))
+        console.print(f"[dim]{pdf_file}[/dim]")
 
-    console.print(f"\n[bold]核心问题:[/bold] {result.get('problem', '')}")
+        with console.status("正在解析本地 PDF 并分析..."):
+            result = orch.analyzer.analyze_local_pdf(pdf_file, title=title, focus=focus)
 
-    contributions = result.get("contributions", [])
-    if contributions:
-        console.print("\n[bold]主要贡献:[/bold]")
-        for item in contributions:
-            console.print(f"  • {item}")
+        _print_analysis_result(display_title, result, local=True)
+        return
 
-    if result.get("method_summary"):
-        console.print(f"\n[bold]方法概览:[/bold] {result.get('method_summary', '')}")
+    paper_id = source.rstrip("/").split("/")[-1].replace(".pdf", "")
+    console.print(Panel(f"[bold]arXiv 论文阅读（多模态细读版）[/bold] {paper_id}", style="blue"))
+    with console.status("正在下载 arXiv 论文并进行多模态分析..."):
+        papers = orch.arxiv.search(f"id:{paper_id}", max_results=1)
+        if not papers:
+            console.print("[red]未找到该 arXiv 论文[/red]")
+            raise typer.Exit(1)
+        result = orch.analyze_paper_multimodal(papers[0], focus)
 
-    datasets = result.get("datasets", [])
-    if datasets:
-        console.print("\n[bold]数据集:[/bold]")
-        for dataset in datasets:
-            console.print(f"  • {_format_dataset_brief(dataset)}")
+    _print_analysis_result(papers[0].title, result, local=False)
 
-    if result.get("results"):
-        console.print(f"\n[bold]实验结果:[/bold] {result['results']}")
 
-    weaknesses = result.get("weaknesses", [])
-    if weaknesses:
-        console.print("\n[bold]局限性:[/bold]")
-        for item in weaknesses:
-            console.print(f"  • {item}")
-
-    note_path = result.get("_note_path")
-    if note_path:
-        console.print(f"\n[green]笔记已保存至: {note_path}[/green]")
+@app.command("paper-reader")
+def paper_reader(
+    source: str = typer.Argument(..., help="本地 PDF 路径，或 arXiv ID / arXiv URL"),
+    title: str = typer.Option(None, "--title", "-t", help="本地 PDF 可选手动指定标题"),
+    focus: str = typer.Option(None, "--focus", "-f", help="关注点"),
+):
+    """read-paper 的别名。"""
+    read_paper(source=source, title=title, focus=focus)
 
 
 @app.command()
@@ -232,7 +243,7 @@ def research(
     max_tokens: int = typer.Option(200000, "--max-tokens", "-t", help="总 token 上限"),
     legacy: bool = typer.Option(False, "--legacy", help="使用旧的编排式流程"),
 ):
-    """对主题进行深度研究并生成报告。"""
+    """对主题进行深度研究并生成报告。默认走保守版论文分析链路。"""
     root = Path(__file__).parent
     settings = Settings.from_env(root)
 
@@ -270,7 +281,7 @@ def research(
         reports_dir = settings.workspace_dir / "reports"
         reports_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        safe_topic = "".join(c if c.isalnum() or c in ' -_' else '' for c in topic)[:40].strip()
+        safe_topic = "".join(c if c.isalnum() or c in " -_" else "" for c in topic)[:40].strip()
         report_path = reports_dir / f"{timestamp}_{safe_topic}.md"
         report_path.write_text(report, encoding="utf-8")
 
@@ -361,6 +372,7 @@ def _dispatch(orch, agent, action) -> str:
     if current_action == "memory_query":
         stats = orch.memory_stats()
         ctx = orch.memory.format_context_for_prompt(action.topic or "research")
+        paper_graph = orch.memory.get_paper_graph_context(action.topic or "research", top_k=5)
         recent = [
             {
                 "id": ep.id,
@@ -390,6 +402,7 @@ def _dispatch(orch, agent, action) -> str:
         brief = {
             "stats": stats,
             "context": ctx[:2000],
+            "paper_graph": paper_graph,
             "recent_episodes": recent,
             "relevant_skills": skills,
             "related_papers": papers,
@@ -467,7 +480,7 @@ def _dispatch(orch, agent, action) -> str:
         agent.add_tool_result(f"research done. report at {result.report_file}")
         return agent.summarize_result(action, brief)
 
-    return action.reply or "我暂时还不确定该怎么帮你，能再说得具体一点吗？"
+    return action.reply or "我暂时还不确定该怎么帮你，你可以再具体一点。"
 
 
 if __name__ == "__main__":

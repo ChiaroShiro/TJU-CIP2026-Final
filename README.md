@@ -154,7 +154,7 @@ python main.py analyze "2301.00234" --focus "方法论"
 也可以直接阅读本地 PDF：
 
 ```bash
-python main.py read-paper "D:\path\to\paper.pdf" --focus "方法论"
+python main.py read-paper "https://arxiv.org/abs/2301.00234" --focus "方法论"
 ```
 
 如果 PDF metadata 里的标题不准，可以手动指定：

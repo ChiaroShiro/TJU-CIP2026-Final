@@ -31,7 +31,7 @@ class ResearchOrchestrator:
         self.memory = MemoryManager(settings)
         self.store = NoteStore(settings.workspace_dir / "notes")
         self.evaluator = DirectionEvaluator(self.llm, settings)
-        self.analyzer = PaperAnalyzer(self.llm, settings)
+        self.analyzer = PaperAnalyzer(self.llm, settings, memory=self.memory)
         self.arxiv = ArxivSearcher(max_results=settings.search_top_k)
         self.s2 = SemanticScholarSearcher()
         self.reflection_engine = ReflectionEngine(self.llm, self.memory)
@@ -61,6 +61,9 @@ class ResearchOrchestrator:
 
     def analyze_paper(self, paper: PaperItem, focus: Optional[str] = None) -> dict:
         return self.analyzer.analyze(paper, focus)
+
+    def analyze_paper_multimodal(self, paper: PaperItem, focus: Optional[str] = None) -> dict:
+        return self.analyzer.analyze_multimodal(paper, focus)
 
     def search_papers_multi(self, queries: List[str], per_query: int = 4) -> List[PaperItem]:
         """用多个查询并行搜索，合并去重。"""

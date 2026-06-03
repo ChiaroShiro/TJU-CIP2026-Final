@@ -109,7 +109,8 @@ def build_analyze_paper_tool(
     return Tool(
         name="analyze_paper",
         description=(
-            "Deeply analyze one paper (downloads full text, does section-level map-reduce). "
+            "Deeply analyze one paper in conservative mode (downloads full text, does section-level map-reduce). "
+            "This path prioritizes note quality and does not rely on image understanding during main synthesis. "
             "Produces a structured note following paper-reader quality standards: "
             "TL;DR, contributions, method summary, formulas with symbol legends, "
             "datasets, results with numbers, critical view, reproducibility checklist. "
