@@ -156,16 +156,55 @@ python main.py search "reinforcement learning for LLM reasoning"
 
 ### 3️⃣ 深度分析论文
 
+项目里现在有两条论文阅读命令：
+
+- `analyze`
+  - 保守版，默认给调研流程使用
+  - 面向 `arXiv ID / arXiv URL`
+  - 优先做稳定的文本分析，不主动走图片理解
+  - 更适合批量调研、方向评估、`research` 链路
+
+- `read-paper`
+  - 细读版
+  - 支持 `本地 PDF` 和 `arXiv ID / arXiv URL`
+  - `arXiv` 来源会走多模态细读，支持结合论文图片做额外解读
+  - `本地 PDF` 来源目前走保守版文本细读，不强依赖图片
+  - 更适合你已经决定要认真读某一篇论文时使用
+
+可以直接按下面理解：
+
+| 命令 | 支持输入 | 默认风格 | 是否看图 | 适合场景 |
+| --- | --- | --- | --- | --- |
+| `analyze` | arXiv ID / arXiv URL | 保守版 | 默认不看图 | 调研、综述、批量筛论文 |
+| `read-paper` | 本地 PDF / arXiv ID / arXiv URL | 细读版 | arXiv 会看图；本地 PDF 默认不看图 | 精读单篇论文、沉淀详细笔记 |
+
+#### `analyze`：保守版 arXiv 分析
+
 分析单篇论文的核心内容：
 
 ```bash
 python main.py analyze "2301.00234" --focus "方法论"
 ```
 
-也可以直接阅读本地 PDF：
+特点：
+
+- 输出更克制，适合调研场景
+- 默认中文总结
+- 会生成论文笔记，但不会像 `read-paper` 那样强调多模态细读
+- `research` 默认调用的是这一条链路
+
+#### `read-paper`：细读论文
+
+如果你想认真读一篇论文，使用 `read-paper`：
 
 ```bash
 python main.py read-paper "https://arxiv.org/abs/2301.00234" --focus "方法论"
+```
+
+也可以直接阅读本地 PDF：
+
+```bash
+python main.py read-paper "D:\path\to\paper.pdf" --focus "方法论"
 ```
 
 如果 PDF metadata 里的标题不准，可以手动指定：
@@ -173,6 +212,12 @@ python main.py read-paper "https://arxiv.org/abs/2301.00234" --focus "方法论"
 ```bash
 python main.py read-paper "D:\path\to\paper.pdf" --title "Direct Preference Optimization" --focus "实验设计"
 ```
+
+特点：
+
+- `arXiv` 版本会走多模态细读，包含图表补充解读
+- `本地 PDF` 版本目前更偏保守版文本细读
+- 会生成更完整的论文笔记，适合放进 `workspace/paper_notes/`
 
 **输出包含**：
 - 核心问题
