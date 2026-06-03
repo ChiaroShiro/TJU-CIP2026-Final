@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from datetime import datetime
 from pathlib import Path
+import time
 
 import typer
 from dotenv import load_dotenv
@@ -13,6 +14,7 @@ from src.agents.conversational_agent import ConversationalAgent
 from src.agents.manager import ResearchManager
 from src.core.config import Settings
 from src.core.llm import LLMClient
+from src.gui_app import launch_gui
 from src.orchestrator import ResearchOrchestrator
 
 
@@ -360,6 +362,29 @@ def chat():
 
         agent.add_assistant_message(reply)
         console.print(Panel(reply, title="[bold magenta]Agent[/bold magenta]", border_style="magenta"))
+
+
+@app.command()
+def gui(
+    no_browser: bool = typer.Option(False, "--no-browser", help="只启动服务，不自动打开浏览器"),
+):
+    """启动本地 GUI 页面。"""
+    orch = get_orchestrator()
+    url = launch_gui(orch, open_browser=not no_browser)
+    console.print(
+        Panel.fit(
+            f"[bold cyan]GUI 已启动[/bold cyan]\n"
+            f"访问地址: {url}\n"
+            f"按 [bold]Ctrl+C[/bold] 关闭服务",
+            border_style="cyan",
+        )
+    )
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        console.print("\n[yellow]GUI 已关闭[/yellow]")
 
 
 def _dispatch(orch, agent, action) -> str:

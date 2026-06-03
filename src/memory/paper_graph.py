@@ -217,6 +217,21 @@ class PaperGraphMemory:
             ).fetchall()
         return [self._to_paper_node(row) for row in rows]
 
+    def list_papers(self, limit: int = 100) -> List[PaperNode]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT paper_id, title, method_name, note_path, problem,
+                       method_summary, tldr, tags_json, datasets_json,
+                       related_work_json, metadata_json, created_at, updated_at
+                FROM paper_nodes
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [self._to_paper_node(row) for row in rows]
+
     def get_neighbors(self, paper_id: str, limit: int = 10) -> List[PaperEdge]:
         with self._conn() as conn:
             rows = conn.execute(
@@ -229,6 +244,20 @@ class PaperGraphMemory:
                 LIMIT ?
                 """,
                 (paper_id, paper_id, limit),
+            ).fetchall()
+        return [self._to_paper_edge(row) for row in rows]
+
+    def list_edges(self, limit: int = 200) -> List[PaperEdge]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT src_paper_id, dst_paper_id, relation_type,
+                       relation_strength, evidence, source_kind, created_at
+                FROM paper_edges
+                ORDER BY relation_strength DESC, created_at DESC
+                LIMIT ?
+                """,
+                (limit,),
             ).fetchall()
         return [self._to_paper_edge(row) for row in rows]
 

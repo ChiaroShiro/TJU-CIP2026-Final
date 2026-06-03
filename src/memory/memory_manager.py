@@ -305,6 +305,65 @@ class MemoryManager:
             "has_confident_context": has_confident_context,
         }
 
+    def get_paper_graph_snapshot(
+        self,
+        query: str = "",
+        node_limit: int = 40,
+        edge_limit: int = 120,
+        include_neighbors: bool = True,
+    ) -> Dict[str, Any]:
+        nodes = (
+            self.paper_graph.search_papers(query, limit=node_limit)
+            if (query or "").strip()
+            else self.paper_graph.list_papers(limit=node_limit)
+        )
+        node_map: Dict[str, Dict[str, Any]] = {}
+        for node in nodes:
+            node_map[node.paper_id] = self._serialize_paper_node(node)
+
+        edges = []
+        seen_edges = set()
+
+        def _append_edge(edge) -> None:
+            key = (
+                edge.src_paper_id,
+                edge.dst_paper_id,
+                edge.relation_type,
+                edge.source_kind,
+            )
+            if key in seen_edges or len(edges) >= edge_limit:
+                return
+            seen_edges.add(key)
+            edges.append(self._serialize_paper_edge(edge))
+
+        if include_neighbors:
+            for node in nodes:
+                for edge in self.paper_graph.get_neighbors(node.paper_id, limit=12):
+                    _append_edge(edge)
+                    if edge.src_paper_id not in node_map:
+                        src = self.paper_graph.get_paper(edge.src_paper_id)
+                        if src:
+                            node_map[src.paper_id] = self._serialize_paper_node(src)
+                    if edge.dst_paper_id not in node_map:
+                        dst = self.paper_graph.get_paper(edge.dst_paper_id)
+                        if dst:
+                            node_map[dst.paper_id] = self._serialize_paper_node(dst)
+                    if len(edges) >= edge_limit:
+                        break
+                if len(edges) >= edge_limit:
+                    break
+        else:
+            for edge in self.paper_graph.list_edges(limit=edge_limit):
+                if edge.src_paper_id in node_map or edge.dst_paper_id in node_map:
+                    _append_edge(edge)
+
+        return {
+            "query": query,
+            "nodes": list(node_map.values()),
+            "edges": edges,
+            "stats": self.stats(),
+        }
+
     def _compute_graph_match_confidence(self, node, query: str) -> float:
         query_lower = (query or "").strip().lower()
         if not query_lower:
@@ -563,4 +622,34 @@ class MemoryManager:
             "vectors": self.vector.count(),
             "paper_nodes": self.paper_graph.count_nodes(),
             "paper_edges": self.paper_graph.count_edges(),
+        }
+
+    @staticmethod
+    def _serialize_paper_node(node) -> Dict[str, Any]:
+        return {
+            "paper_id": node.paper_id,
+            "title": node.title,
+            "method_name": node.method_name,
+            "note_path": node.note_path,
+            "problem": node.problem,
+            "method_summary": node.method_summary,
+            "tldr": node.tldr,
+            "tags": node.tags or [],
+            "datasets": node.datasets or [],
+            "related_work": node.related_work or [],
+            "metadata": node.metadata or {},
+            "created_at": node.created_at,
+            "updated_at": node.updated_at,
+        }
+
+    @staticmethod
+    def _serialize_paper_edge(edge) -> Dict[str, Any]:
+        return {
+            "src_paper_id": edge.src_paper_id,
+            "dst_paper_id": edge.dst_paper_id,
+            "relation_type": edge.relation_type,
+            "relation_strength": edge.relation_strength,
+            "evidence": edge.evidence,
+            "source_kind": edge.source_kind,
+            "created_at": edge.created_at,
         }

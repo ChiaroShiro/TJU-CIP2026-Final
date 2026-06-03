@@ -188,6 +188,29 @@ python main.py research "大语言模型的可解释性研究"
 
 报告保存在 `workspace/reports/` 目录。
 
+### 5️⃣ 本地 GUI 工作台
+
+如果你希望更方便地使用论文搜索、阅读和图谱查看，可以直接启动本地 GUI：
+
+```bash
+python main.py gui
+```
+
+如果不想自动打开浏览器：
+
+```bash
+python main.py gui --no-browser
+```
+
+GUI 当前支持：
+
+- 搜索论文并一键填入阅读框
+- 调用 `analyze` 保守版分析
+- 调用 `read-paper` 细读模式
+- 浏览 `workspace/paper_notes/` 里的已读笔记
+- 可视化 `paper graph memory` 中的论文节点和关系边
+- 点击图节点查看摘要并快速打开对应笔记
+
 ---
 
 ## 🏗️ 架构设计
