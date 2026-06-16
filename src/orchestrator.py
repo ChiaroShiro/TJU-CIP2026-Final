@@ -16,6 +16,7 @@ from .agents.paper_analyzer import PaperAnalyzer
 from .agents.critic import CriticAgent
 from .agents.reviser import ReviserAgent
 from .services.paper_search import ArxivSearcher, SemanticScholarSearcher
+from .services.paper_search import PaperDiscoveryService
 from .core.prompts import (
     memory_augmented_planner_prompt, planner_prompt,
     summarizer_prompt, reflection_prompt, reporter_prompt,
@@ -34,6 +35,7 @@ class ResearchOrchestrator:
         self.analyzer = PaperAnalyzer(self.llm, settings, memory=self.memory)
         self.arxiv = ArxivSearcher(max_results=settings.search_top_k)
         self.s2 = SemanticScholarSearcher()
+        self.discovery = PaperDiscoveryService(arxiv_max_results=settings.search_top_k)
         self.reflection_engine = ReflectionEngine(self.llm, self.memory)
         # 独立 LLMClient 实例，通过 system prompt 隔离角色
         self.critic = CriticAgent(
@@ -85,6 +87,10 @@ class ResearchOrchestrator:
                 seen.add(p.title)
                 papers.append(p)
         return papers
+
+    def discover_papers(self, query: str, max_results: int = 10) -> List[PaperItem]:
+        papers = self.discovery.search_topic(query, max_results=max_results)
+        return self.discovery.enrich_with_code(papers, max_code_hits=3)
 
     def run_deep_research(self, topic: str) -> ResearchResult:
         # 查询所有记忆层，为规划提供上下文

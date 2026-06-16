@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from datetime import datetime
 from pathlib import Path
+import sys
 import time
 
 import typer
@@ -16,11 +17,16 @@ from src.core.config import Settings
 from src.core.llm import LLMClient
 from src.gui_app import launch_gui
 from src.orchestrator import ResearchOrchestrator
+from src.services.survey_builder import SurveyBuilder
 
 
 load_dotenv()
 
 app = typer.Typer()
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 console = Console()
 
 
@@ -169,6 +175,48 @@ def search(query: str = typer.Argument(..., help="搜索关键词")):
         console.print(f"   作者: {', '.join(paper.authors[:3])}")
         console.print(f"   摘要: {paper.abstract[:150]}...")
         console.print(f"   链接: {paper.url}")
+
+
+@app.command()
+def discover(
+    topic: str = typer.Argument(..., help="研究主题或英文关键词"),
+    max_papers: int = typer.Option(10, "--max-papers", "-n", help="最多返回论文数"),
+):
+    """搜索最新论文并自动关联 GitHub 代码，公开代码论文优先。"""
+    orch = get_orchestrator()
+    with console.status("正在检索论文并关联 GitHub 代码..."):
+        papers = orch.discover_papers(topic, max_results=max_papers)
+
+    table = Table(title=f"论文发现结果: {topic}")
+    table.add_column("#", style="cyan", width=4)
+    table.add_column("年份", width=8)
+    table.add_column("论文")
+    table.add_column("公开代码", style="green")
+    table.add_column("链接")
+    for i, paper in enumerate(papers, 1):
+        year = (paper.published or paper.updated or "")[:4] or "?"
+        table.add_row(str(i), year, paper.title, paper.code_url or "-", paper.url)
+    console.print(table)
+
+
+@app.command()
+def survey(
+    topic: str = typer.Argument(..., help="研究主题"),
+    max_papers: int = typer.Option(12, "--max-papers", "-n", help="综述纳入论文数"),
+):
+    """生成文献综述草稿、算法演进图和 SVG 海报。无需 LLM API key。"""
+    root = Path(__file__).parent
+    settings = Settings.from_env(root)
+    builder = SurveyBuilder(settings.workspace_dir)
+
+    with console.status("正在生成综述、演进图和海报..."):
+        artifact = builder.build(topic, max_papers=max_papers)
+
+    console.print(Panel("[bold green]综述产物已生成[/bold green]", border_style="green"))
+    console.print(f"报告: {artifact.report_file}")
+    console.print(f"演进图: {artifact.timeline_file}")
+    console.print(f"海报: {artifact.poster_file}")
+    console.print(f"原始数据: {artifact.raw_data_file}")
 
 
 @app.command()

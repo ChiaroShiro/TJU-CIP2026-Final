@@ -7,6 +7,7 @@
 from typing import List
 
 from ..services.paper_search import ArxivSearcher, SemanticScholarSearcher
+from ..services.github_search import GitHubCodeSearcher
 from .tool import Tool, ToolResult
 
 
@@ -89,6 +90,51 @@ def build_s2_search_tool(searcher: SemanticScholarSearcher) -> Tool:
                 "query": {
                     "type": "string",
                     "description": "English keyword query, 3-8 words.",
+                },
+                "max_results": {"type": "integer", "default": 5},
+            },
+            "required": ["query"],
+        },
+        run=run,
+    )
+
+
+def build_github_code_search_tool(searcher: GitHubCodeSearcher) -> Tool:
+    def run(args):
+        query = (args.get("query") or "").strip()
+        max_results = int(args.get("max_results", 5))
+        if not query:
+            return ToolResult(success=False, error="query is required")
+        hits = searcher.search(query, max_results=max_results)
+        return ToolResult(
+            success=True,
+            content={
+                "count": len(hits),
+                "repos": [
+                    {
+                        "title": hit.title,
+                        "url": hit.url,
+                        "snippet": hit.snippet,
+                        "confidence": hit.confidence,
+                    }
+                    for hit in hits
+                ],
+            },
+            metadata={"source": "github"},
+        )
+
+    return Tool(
+        name="search_github_code",
+        description=(
+            "Search GitHub repositories related to a paper or method. Use this after paper search "
+            "to prioritize papers with public implementations and to collect code links for the report."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Paper title or method name plus optional keywords.",
                 },
                 "max_results": {"type": "integer", "default": 5},
             },

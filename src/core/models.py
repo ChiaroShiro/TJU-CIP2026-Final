@@ -30,6 +30,11 @@ class PaperItem:
     published: str = ""
     updated: str = ""
     categories: List[str] = field(default_factory=list)
+    code_urls: List[str] = field(default_factory=list)
+    code_url: str = ""
+    code_repos: List[str] = field(default_factory=list)
+    has_code: bool = False
+    code_confidence: float = 0.0
 
 
 @dataclass
@@ -90,3 +95,15 @@ class ResearchResult:
     reflection: Optional[ReflectionResult] = None
     critic_reviews: List[CriticReview] = field(default_factory=list)
     revision_count: int = 0
+
+
+@dataclass
+class SurveyArtifact:
+    topic: str
+    output_dir: str
+    papers: List[PaperItem] = field(default_factory=list)
+    report_file: str = ""
+    poster_file: str = ""
+    timeline_file: str = ""
+    raw_data_file: str = ""
+    created_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())

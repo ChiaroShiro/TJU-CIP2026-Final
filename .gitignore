@@ -25,6 +25,7 @@ workspace/notes/
 workspace/pdf_cache/
 workspace/vector_db/
 workspace/memory/
+workspace/surveys/
 
 # ───── Markdown 文档（除根目录 README.md 外全部忽略）─────
 *.md

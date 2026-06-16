@@ -15,10 +15,11 @@ from ..agents.paper_analyzer import PaperAnalyzer
 from ..memory.memory_manager import MemoryManager
 from ..learning.reflection import ReflectionEngine
 from ..services.paper_search import ArxivSearcher, SemanticScholarSearcher
+from ..services.github_search import GitHubCodeSearcher
 from ..services.paper_fetcher import PaperFetcher
 from ..services.web_searcher import WebSearcher
 from ..tools.tool import ToolRegistry
-from ..tools.search_tools import build_arxiv_search_tool, build_s2_search_tool
+from ..tools.search_tools import build_arxiv_search_tool, build_github_code_search_tool, build_s2_search_tool
 from ..tools.paper_tools import build_fetch_fulltext_tool, build_analyze_paper_tool
 from ..tools.memory_tools import (
     build_retrieve_memory_tool,
@@ -39,6 +40,7 @@ You autonomously conduct deep academic research on a given topic. You have a too
 
 ## Available Tools
 - **search_arxiv** / **search_semantic_scholar**: Search for papers. Use short English keyword queries (3-8 words). Try multiple angles.
+- **search_github_code**: Search GitHub repositories for public implementations. Use this to prioritize papers with code and collect reproducibility links.
 - **fetch_paper_fulltext**: Download a paper's PDF and get section-level text. Use when abstract isn't enough.
 - **analyze_paper**: Deep analysis of one paper (map-reduce over sections). Produces structured note with formulas, tables, critical view. Use on the 2-3 most important papers only.
 - **retrieve_memory**: Check if you've researched this topic before. Call this FIRST to avoid repeating prior work.
@@ -52,12 +54,13 @@ You autonomously conduct deep academic research on a given topic. You have a too
 
 1. **Recall**: retrieve_memory first — see what you already know about this topic.
 2. **Explore**: search with 3-5 different keyword angles. Don't just use one query.
-3. **Deep dive**: for the 2-3 most relevant papers, use analyze_paper to get full details.
-4. **Synthesize**: save_note with your intermediate findings as you go.
-5. **Draft**: when you have enough material, compose a comprehensive Markdown report.
-6. **Review**: delegate_to_critic to get independent feedback.
-7. **Revise**: if score < 0.7, delegate_to_reviser. You can also search more yourself.
-8. **Finalize**: save_research_episode (triggers learning), then finish with the final report.
+3. **Code-first filtering**: for candidate papers, call search_github_code on paper titles or method names and prioritize papers with public code.
+4. **Deep dive**: for the 2-3 most relevant papers, use analyze_paper to get full details.
+5. **Synthesize**: save_note with your intermediate findings as you go.
+6. **Draft**: when you have enough material, compose a comprehensive Markdown report.
+7. **Review**: delegate_to_critic to get independent feedback.
+8. **Revise**: if score < 0.7, delegate_to_reviser. You can also search more yourself.
+9. **Finalize**: save_research_episode (triggers learning), then finish with the final report.
 
 ## Report Quality Standards
 
@@ -68,6 +71,8 @@ Your final report MUST include:
 - Risks, limitations, and open questions
 - Actionable recommendations
 - References section with all cited papers
+- Open-source code section listing GitHub repositories and which paper/method each repo supports
+- Algorithm evolution section with dates ordered chronologically and no unsupported timeline claims
 
 ## Decision Rules
 
@@ -98,7 +103,7 @@ You have a STRICT token budget (~200K). Each step costs ~5-10K tokens. This mean
 - Steps 1-8: Search and gather material
 - Steps 9-12: Write report + delegate_to_critic
 - Steps 13-15: Revise if needed + save_research_episode + finish
-- Do NOT spend more than 8 steps on searching. Material doesn't need to be perfect — write with what you have.
+- Do NOT spend more than 10 steps on searching. Material doesn't need to be perfect — write with what you have.
 - If a search tool fails, don't retry — use a different source or move on.
 """
 
@@ -128,6 +133,7 @@ class ResearchManager(BaseAgent):
         self.reflection = ReflectionEngine(LLMClient(settings), self.memory)
         self.arxiv = ArxivSearcher(max_results=settings.search_top_k)
         self.s2 = SemanticScholarSearcher()
+        self.github = GitHubCodeSearcher()
         self.fetcher = PaperFetcher(settings.workspace_dir / "pdf_cache")
         self.analyzer = PaperAnalyzer(LLMClient(settings), settings)
         self.web = WebSearcher()
@@ -147,6 +153,7 @@ class ResearchManager(BaseAgent):
         registry = ToolRegistry()
         registry.register(build_arxiv_search_tool(self.arxiv))
         registry.register(build_s2_search_tool(self.s2))
+        registry.register(build_github_code_search_tool(self.github))
         registry.register(build_fetch_fulltext_tool(self.fetcher))
         registry.register(build_analyze_paper_tool(self.analyzer, self.arxiv, self.memory))
         registry.register(build_retrieve_memory_tool(self.memory))

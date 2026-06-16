@@ -14,15 +14,16 @@ class LLMClient:
     """
 
     def __init__(self, settings: Settings) -> None:
-        if not settings.llm_api_key:
-            raise ValueError("LLM_API_KEY is required in .env.")
         self.settings = settings
-        self.client = OpenAI(
-            api_key=settings.llm_api_key,
-            base_url=settings.llm_base_url,
-        )
+        self.client = None
+        if settings.llm_api_key:
+            self.client = OpenAI(
+                api_key=settings.llm_api_key,
+                base_url=settings.llm_base_url,
+            )
 
     def invoke(self, messages: List[Dict[str, str]], temperature: float) -> str:
+        self._ensure_client()
         response = self.client.chat.completions.create(
             model=self.settings.llm_model,
             messages=messages,
@@ -37,6 +38,7 @@ class LLMClient:
         temperature: float,
         tool_choice: str = "auto",
     ):
+        self._ensure_client()
         return self.client.chat.completions.create(
             model=self.settings.llm_model,
             messages=messages,
@@ -44,6 +46,13 @@ class LLMClient:
             tools=tools,
             tool_choice=tool_choice,
         )
+
+    def _ensure_client(self) -> None:
+        if self.client is None:
+            raise ValueError(
+                "LLM_API_KEY is required for LLM-backed commands. "
+                "Set it in .env before running research/analyze/evaluate."
+            )
 
     def _extract_text_response(self, response: Any) -> str:
         """兼容不同 OpenAI 兼容网关返回的文本结构。"""

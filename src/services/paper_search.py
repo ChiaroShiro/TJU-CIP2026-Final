@@ -4,6 +4,7 @@ import requests
 from typing import List, Optional
 
 from ..core.models import PaperItem
+from .github_search import GitHubCodeSearcher
 
 
 class ArxivSearcher:
@@ -99,3 +100,102 @@ class SemanticScholarSearcher:
                 print(f"[S2Searcher] search failed ({type(e).__name__}): {str(e)[:120]}")
                 return []
         return []
+
+
+class PaperDiscoveryService:
+    """
+    聚合 arXiv / Semantic Scholar / GitHub 代码线索的论文发现服务。
+    """
+
+    def __init__(self, arxiv_max_results: int = 10):
+        self.arxiv = ArxivSearcher(max_results=arxiv_max_results)
+        self.s2 = SemanticScholarSearcher()
+        self.github = GitHubCodeSearcher()
+
+    def search_topic(self, query: str, max_results: int = 10) -> List[PaperItem]:
+        papers = self.arxiv.search(query, max_results=max_results)
+        if len(papers) < max_results:
+            papers.extend(self.s2.search(query, max_results=max_results - len(papers)))
+        return self._dedupe_and_rank(query, papers)
+
+    def enrich_with_code(self, papers: List[PaperItem], max_code_hits: int = 3) -> List[PaperItem]:
+        enriched: List[PaperItem] = []
+        for paper in papers:
+            code_urls = self._collect_code_urls(paper)
+            if not code_urls:
+                code_hits = self.github.search_repo_for_paper(
+                    paper.title,
+                    keywords=paper.categories[:3],
+                    max_results=max_code_hits,
+                )
+                code_urls = [hit.url for hit in code_hits]
+
+            paper.code_urls = code_urls
+            paper.code_url = code_urls[0] if code_urls else ""
+            paper.code_repos = code_urls
+            paper.has_code = bool(code_urls)
+            paper.code_confidence = self._code_confidence(paper)
+            enriched.append(paper)
+
+        return sorted(
+            enriched,
+            key=lambda p: (
+                1 if p.has_code else 0,
+                p.code_confidence,
+                self._published_year(p.published),
+            ),
+            reverse=True,
+        )
+
+    def _dedupe_and_rank(self, query: str, papers: List[PaperItem]) -> List[PaperItem]:
+        seen = set()
+        deduped: List[PaperItem] = []
+        for paper in papers:
+            key = paper.paper_id or paper.title
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(paper)
+        return sorted(
+            deduped,
+            key=lambda p: (
+                self._query_match_score(query, p),
+                self._published_year(p.published),
+            ),
+            reverse=True,
+        )
+
+    def _collect_code_urls(self, paper: PaperItem) -> List[str]:
+        candidates = []
+        for text in [paper.url, paper.abstract, paper.title]:
+            candidates.extend(self.github.extract_repos_from_text(text))
+        seen = set()
+        cleaned = []
+        for url in candidates:
+            if url not in seen:
+                seen.add(url)
+                cleaned.append(url)
+        return cleaned
+
+    @staticmethod
+    def _published_year(value: str) -> int:
+        try:
+            return int(str(value)[:4])
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _query_match_score(query: str, paper: PaperItem) -> float:
+        q = (query or "").lower()
+        text = f"{paper.title} {paper.abstract} {' '.join(paper.authors)}".lower()
+        score = 0.0
+        for token in [t for t in q.split() if len(t) >= 4]:
+            if token in text:
+                score += 1.0
+        return score + (0.25 if paper.has_code else 0.0)
+
+    @staticmethod
+    def _code_confidence(paper: PaperItem) -> float:
+        if paper.code_urls:
+            return min(1.0, 0.65 + 0.1 * len(paper.code_urls))
+        return 0.0
