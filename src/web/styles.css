@@ -318,6 +318,8 @@ select { appearance: none; cursor: pointer;
   background-size: 200% 100%; animation: shimmer 2.2s linear infinite;
 }
 @keyframes shimmer { to { background-position: 200% 0; } }
+/* 完成态：停止流光、满条变绿，明确"已完成" */
+.activity.done .phase-fill { animation: none; background: linear-gradient(135deg, var(--good), #10b981); }
 .log-stream { max-height: 260px; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; font-size: 12.5px; }
 .log-line { display: flex; gap: 9px; padding: 4px 2px; line-height: 1.5; animation: logIn .3s ease; }
 @keyframes logIn { from { opacity: 0; transform: translateX(-6px); } to { opacity: 1; transform: none; } }
@@ -397,6 +399,7 @@ select { appearance: none; cursor: pointer;
 .budget-track { height: 8px; border-radius: 999px; background: var(--surface-2); overflow: hidden; border: 1px solid var(--border); }
 .budget-fill { height: 100%; width: 0; border-radius: 999px; background: var(--grad); transition: width .4s ease; }
 .budget-fill.warn { background: linear-gradient(135deg, #fbbf24, #fb7185); }
+.budget-fill.done { background: linear-gradient(135deg, var(--good), #10b981); }
 
 .research-grid { display: grid; grid-template-columns: 1fr 1.15fr; gap: 18px; align-items: start; }
 .trace-card, .report-card { margin-bottom: 0; }

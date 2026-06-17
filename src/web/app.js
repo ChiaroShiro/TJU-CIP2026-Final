@@ -231,6 +231,7 @@ async function streamPost(url, payload, onEvent) {
 /* ------------------------------ Activity 面板 ------------------------------ */
 function makeActivity(host) {
   host.hidden = false;
+  host.classList.remove("done");   // 清除上一轮完成态，避免新运行一开始就显示绿色满条
   host.innerHTML =
     `<div class="phase-bar">
        <div class="phase-label"><span class="pl-text">准备中…</span><span class="pct">0%</span></div>
@@ -256,7 +257,11 @@ function makeActivity(host) {
       logStream.appendChild(el);
       logStream.scrollTop = logStream.scrollHeight;
     },
-    done(label) { if (label) plText.textContent = label; fill.style.width = "100%"; pctEl.textContent = "100%"; },
+    done(label) {
+      if (label) plText.textContent = label;
+      fill.style.width = "100%"; pctEl.textContent = "100%";
+      host.classList.add("done");   // 停止流光 + 变绿，明确"已完成"而非"仍在跑"
+    },
   };
 }
 
@@ -601,7 +606,11 @@ async function runResearch() {
   $("r-report").innerHTML = `<div class="empty"><div class="ic">⏳</div><div>研究启动中…</div></div>`;
   $("r-stats").hidden = true;
   $("r-budget").hidden = research.mode !== "auto";
-  if (research.mode === "auto") { $("r-budget-fill").style.width = "0%"; $("r-budget-meta").textContent = ""; }
+  if (research.mode === "auto") {
+    const bf = $("r-budget-fill");
+    bf.style.width = "0%"; bf.classList.remove("done", "warn");
+    $("r-budget-meta").textContent = "";
+  }
   setStatus("r-status", "研究进行中，请保持页面打开…");
   busy($("r-run"), true, "研究中…");
   const trace = $("r-trace");
@@ -645,6 +654,20 @@ function finalizeResearch(p) {
   const st = p.stats || {};
   const bits = [];
   if (p.mode === "auto") {
+    // 完成即把预算条填满：Agent 提前结束时消耗未到预算上限，但任务已完成，
+    // 不应让"进度条没满"误导成没跑完。完成=绿色满条，未完成=橙色满条。
+    const bf = $("r-budget-fill");
+    if (bf) {
+      $("r-budget").hidden = false;
+      bf.style.width = "100%";
+      bf.classList.toggle("done", !!p.finished);
+      bf.classList.toggle("warn", !p.finished);
+      const steps = st.total_steps ?? research.steps;
+      const tokens = st.total_tokens ?? research.tokens;
+      $("r-budget-meta").textContent =
+        (p.finished ? "✓ 已完成" : "⚠ 未完成(" + (p.finish_reason || "") + ")") +
+        ` · 步 ${steps}/${research.maxSteps} · token ${Number(tokens).toLocaleString()}/${research.maxTokens.toLocaleString()}`;
+    }
     bits.push(`步数 ${st.total_steps ?? "-"}`, `tokens ${(st.total_tokens ?? 0).toLocaleString()}`,
       `耗时 ${st.elapsed_ms ? (st.elapsed_ms / 1000).toFixed(1) + "s" : "-"}`,
       `状态 ${p.finished ? "完成" : "未完成(" + (p.finish_reason || "") + ")"}`);
