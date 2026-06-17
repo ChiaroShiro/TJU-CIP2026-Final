@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Deep Research Agent · Workspace</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='22' fill='%230f766e'/%3E%3Ctext x='50' y='70' font-size='52' text-anchor='middle' fill='white' font-family='sans-serif' font-weight='bold'%3EDR%3C/text%3E%3C/svg%3E" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="stylesheet" href="/styles.css" />
+  <!-- d3：本地 vendor 优先，失败时回退 CDN；都失败则前端自动降级为静态布局 -->
+  <script src="/vendor/d3.v7.min.js"
+          onerror="this.onerror=null;this.src='https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js'"></script>
+</head>
+<body>
+  <div id="toast-host"></div>
+
+  <!-- ============================ 顶栏 ============================ -->
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo">DR</div>
+      <div class="titles">
+        <b>Deep Research Agent</b>
+        <span>Paper Workspace</span>
+      </div>
+    </div>
+    <div class="metric-chips" id="metric-chips">
+      <div class="chip"><span class="k">Nodes</span><span class="v" id="m-nodes">–</span></div>
+      <div class="chip"><span class="k">Edges</span><span class="v" id="m-edges">–</span></div>
+      <div class="chip"><span class="k">Episodes</span><span class="v" id="m-episodes">–</span></div>
+      <div class="chip"><span class="k">Skills</span><span class="v" id="m-skills">–</span></div>
+      <div class="chip"><span class="k">Vectors</span><span class="v" id="m-vectors">–</span></div>
+    </div>
+    <div class="top-actions">
+      <button class="kbd-hint" id="open-cmdk">搜索 <span class="kbd">Ctrl K</span></button>
+      <button class="icon-btn" id="theme-toggle" title="切换深/浅主题">☾</button>
+    </div>
+  </header>
+
+  <!-- ============================ 主体 ============================ -->
+  <main class="layout">
+    <!-- 左侧控制台 -->
+    <aside class="console">
+      <section class="card">
+        <h2><span class="ic">🔬</span> 论文工作台</h2>
+        <div class="sub">输入 arXiv ID / 链接 / 本地 PDF 路径，做保守版或多模态细读。</div>
+        <div class="field">
+          <label for="an-source">论文来源</label>
+          <input id="an-source" placeholder="本地 PDF 路径，或 arXiv ID / 链接" />
+        </div>
+        <div class="field">
+          <label for="an-title">本地 PDF 可选标题</label>
+          <input id="an-title" placeholder="仅本地 PDF 需要时填写" />
+        </div>
+        <div class="field">
+          <label for="an-focus">关注点</label>
+          <textarea id="an-focus" placeholder="例如：方法细节、实验设置、与已有 VLA 工作的关系"></textarea>
+        </div>
+        <div class="field">
+          <label for="an-mode">分析模式</label>
+          <select id="an-mode">
+            <option value="read-paper">read-paper · 多模态细读</option>
+            <option value="analyze">analyze · 保守版</option>
+          </select>
+        </div>
+        <div class="btn-row">
+          <button class="btn btn-primary" id="btn-analyze">开始分析</button>
+          <button class="btn btn-ghost btn-sm" id="btn-refresh-graph">刷新图谱</button>
+          <button class="btn btn-ghost btn-sm" id="btn-refresh-notes">刷新笔记</button>
+        </div>
+        <div class="status" id="st-analyze"></div>
+      </section>
+
+      <section class="card">
+        <h2><span class="ic">🔎</span> 论文搜索</h2>
+        <div class="field">
+          <label for="search-q">关键词（英文最佳）</label>
+          <input id="search-q" placeholder="例如：latent world model for robot policy" />
+        </div>
+        <div class="btn-row">
+          <button class="btn btn-secondary" id="btn-search">搜索论文</button>
+        </div>
+        <div class="status" id="st-search"></div>
+        <div class="scroll-list" id="search-results"></div>
+      </section>
+
+      <section class="card">
+        <h2><span class="ic">📒</span> 已读笔记</h2>
+        <div class="field">
+          <label for="notes-q">筛选关键词</label>
+          <input id="notes-q" placeholder="留空显示最新笔记" />
+        </div>
+        <div class="btn-row">
+          <button class="btn btn-ghost btn-sm" id="btn-filter-notes">筛选</button>
+        </div>
+        <div class="scroll-list" id="note-results"></div>
+      </section>
+    </aside>
+
+    <!-- 右侧结果区 -->
+    <section class="results">
+      <!-- 分析结果 -->
+      <section class="card">
+        <div class="card-head"><h2><span class="ic">🧠</span> 分析结果</h2></div>
+        <div class="analysis-grid">
+          <div class="panel-box analysis-body" id="analysis-output">
+            <div class="empty"><div class="ic">📄</div><div>这里会显示论文分析、保存路径与正文摘要。</div>
+              <div class="hint">先在左侧「论文工作台」开始一次分析</div></div>
+          </div>
+          <div class="analysis-side">
+            <div class="panel-box"><h3>主要贡献</h3><ul id="an-contribs"><li class="li-empty">等待分析结果</li></ul></div>
+            <div class="panel-box"><h3>数据集</h3><ul id="an-datasets"><li class="li-empty">等待分析结果</li></ul></div>
+            <div class="panel-box"><h3>记忆连接</h3><ul id="an-memory"><li class="li-empty">等待分析结果</li></ul></div>
+            <div class="panel-box"><h3>引用中的相似工作</h3><ul id="an-related"><li class="li-empty">等待分析结果</li></ul></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 论文关系图谱 -->
+      <section class="card">
+        <div class="card-head">
+          <h2><span class="ic">🕸️</span> 论文关系图谱</h2>
+          <span class="eyebrow" id="graph-engine">d3 force</span>
+        </div>
+        <div class="field" style="margin-bottom:14px;">
+          <label for="graph-q">图谱检索词</label>
+          <div class="btn-row">
+            <input id="graph-q" placeholder="例如：VLA / DPO / 世界模型，留空显示最近节点" style="flex:1;min-width:200px;" />
+            <button class="btn btn-primary btn-sm" id="btn-query-graph">查询</button>
+          </div>
+        </div>
+        <div class="graph-wrap">
+          <div class="graph-surface">
+            <div class="graph-toolbar">
+              <button id="g-zoom-in" title="放大">＋</button>
+              <button id="g-zoom-out" title="缩小">－</button>
+              <button id="g-reset" title="重置视图">⟲</button>
+            </div>
+            <svg class="graph-stage" id="graph-stage"></svg>
+          </div>
+          <div class="graph-info">
+            <div class="panel-box">
+              <h3>图例</h3>
+              <div class="legend">
+                <div class="legend-item"><span class="dot" style="background:#2dd4bf;"></span> 已读论文节点</div>
+                <div class="legend-item"><span class="dot" style="background:#f59e0b;"></span> 引用占位节点</div>
+                <div class="legend-item"><span class="line-key" style="border-color:#38bdf8;"></span> builds_on</div>
+                <div class="legend-item"><span class="line-key" style="border-color:#fb7185;"></span> compares_with</div>
+                <div class="legend-item"><span class="line-key" style="border-color:#94a3b8;"></span> similar_to</div>
+              </div>
+            </div>
+            <div class="panel-box node-detail">
+              <h3>选中节点</h3>
+              <div id="graph-node-detail" class="empty" style="padding:14px 0;"><div class="hint">点击图中节点查看详情</div></div>
+            </div>
+            <div class="panel-box">
+              <h3>统计</h3>
+              <div class="codebox" id="graph-stats">等待加载…</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 图表工作室 -->
+      <section class="card">
+        <div class="card-head">
+          <h2><span class="ic">📊</span> 图表工作室</h2>
+          <span class="eyebrow">SVG · LaTeX · Image 多模式</span>
+        </div>
+        <div class="studio-tabs">
+          <button class="studio-tab active" data-pane="survey">综述生成（真实 SVG）</button>
+          <button class="studio-tab" data-pane="modes">渲染模式试验</button>
+        </div>
+
+        <!-- 综述生成 -->
+        <div class="studio-pane active" id="pane-survey">
+          <div class="field">
+            <label for="survey-topic">综述主题</label>
+            <div class="btn-row">
+              <input id="survey-topic" placeholder="例如：diffusion policy for robot manipulation" style="flex:1;min-width:200px;" />
+              <input id="survey-n" type="number" min="3" max="30" value="10" title="纳入论文数" style="width:92px;" />
+              <button class="btn btn-primary" id="btn-survey">生成综述与图</button>
+            </div>
+          </div>
+          <div class="status" id="st-survey"></div>
+          <div class="figure-gallery" id="survey-figures"></div>
+          <div class="panel-box" id="survey-report" style="margin-top:16px;display:none;"></div>
+        </div>
+
+        <!-- 渲染模式试验 -->
+        <div class="studio-pane" id="pane-modes">
+          <div class="sub">同一套「图产物（Figure）」契约，前端按 <code>kind</code> 分发渲染。点击下面任一模式查看效果——证明 SVG / LaTeX / 图像模型可统一接入。</div>
+          <div class="btn-row" style="margin:12px 0;">
+            <button class="btn btn-ghost" data-figmode="svg">SVG 矢量</button>
+            <button class="btn btn-ghost" data-figmode="latex">LaTeX 描述</button>
+            <button class="btn btn-ghost" data-figmode="image">图像模型</button>
+          </div>
+          <div class="status" id="st-figmode"></div>
+          <div class="figure-gallery" id="figmode-out"></div>
+        </div>
+      </section>
+
+      <!-- 笔记查看器 -->
+      <section class="card">
+        <div class="card-head"><h2><span class="ic">📖</span> 笔记查看器</h2></div>
+        <div class="panel-box analysis-body" id="note-viewer" style="max-height:680px;">
+          <div class="empty"><div class="ic">📚</div><div>选择左侧一篇笔记查看渲染后的 Markdown。</div></div>
+        </div>
+      </section>
+    </section>
+  </main>
+
+  <!-- ============================ 浮层 ============================ -->
+  <div class="overlay cmdk" id="cmdk">
+    <div class="cmdk-inner">
+      <input id="cmdk-input" placeholder="输入关键词后回车，搜索论文…" />
+      <div class="cmdk-foot"><span>↵ 搜索论文</span><span>Esc 关闭</span></div>
+    </div>
+  </div>
+
+  <div class="overlay" id="lightbox">
+    <div class="lightbox-inner" id="lightbox-inner"></div>
+  </div>
+
+  <script src="/app.js" defer></script>
+</body>
+</html>

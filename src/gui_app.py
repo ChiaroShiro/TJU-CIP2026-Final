@@ -1,45 +1,162 @@
+"""本地 GUI 服务。
+
+设计：
+- 前端是 src/web 下的独立静态文件（index.html / styles.css / app.js / vendor/d3）。
+- 后端只做一层薄薄的 JSON API + 静态资源分发，业务逻辑全部委托给 ResearchOrchestrator。
+- 新增能力：
+  * /api/asset   安全分发 workspace 内的本地图片/SVG（修复笔记本地图无法显示）。
+  * /api/survey  调用 SurveyBuilder，把综述报告 + 算法演进图/海报 SVG 接入前端。
+  * /api/figure  统一的「图产物」契约，支持 svg / latex / image 三种渲染模式，
+                 为后续接入 LaTeX 描述图或图像生成模型预留扩展点。
+"""
+
+from __future__ import annotations
+
+import base64
 import json
 import threading
 import webbrowser
-from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict
+from typing import TYPE_CHECKING, Any, Dict, Tuple
 from urllib.parse import parse_qs, urlparse
 
-from .orchestrator import ResearchOrchestrator
+if TYPE_CHECKING:  # 仅类型提示，避免在导入本模块时拉起重型依赖
+    from .orchestrator import ResearchOrchestrator
 
 
-def build_gui_app(orchestrator: ResearchOrchestrator) -> ThreadingHTTPServer:
+WEB_DIR = Path(__file__).parent / "web"
+
+# 只允许分发这些被显式登记的前端文件，杜绝任意路径读取
+_STATIC_ROUTES: Dict[str, Tuple[str, str]] = {
+    "/": ("index.html", "text/html; charset=utf-8"),
+    "/index.html": ("index.html", "text/html; charset=utf-8"),
+    "/styles.css": ("styles.css", "text/css; charset=utf-8"),
+    "/app.js": ("app.js", "application/javascript; charset=utf-8"),
+    "/vendor/d3.v7.min.js": ("vendor/d3.v7.min.js", "application/javascript; charset=utf-8"),
+}
+
+# /api/asset 仅用于显示/下载图片与 SVG 产物，因此白名单收窄到图片类，缩小可读文件面
+_ASSET_CONTENT_TYPES: Dict[str, str] = {
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+}
+
+
+def _resolve_within(base: Path, target: str) -> Path:
+    """把 target 解析为绝对路径，并确保它位于 base 之内（防止路径穿越）。"""
+    base_resolved = base.expanduser().resolve()
+    candidate = Path(target).expanduser()
+    if not candidate.is_absolute():
+        candidate = base_resolved / candidate
+    candidate = candidate.resolve()
+    if base_resolved != candidate and base_resolved not in candidate.parents:
+        raise PermissionError("path escapes workspace")
+    return candidate
+
+
+def build_figure_stub(mode: str, title: str, spec: str = "") -> Dict[str, Any]:
+    """构造统一的「图产物（Figure）」对象。
+
+    前端只依据 kind ∈ {svg, latex, image} 分发渲染，永远不关心图是怎么生成的。
+    这里给三种模式各提供一个可正确渲染的示例 / 占位，证明契约端到端可用；
+    后续把对应分支替换成真实的 LaTeX 编译或图像模型调用即可，前端零改动。
+    """
+    mode = (mode or "svg").strip().lower()
+    title = title or "示例图"
+
+    if mode == "latex":
+        source = spec.strip() or (
+            "\\begin{tikzpicture}\n"
+            "  \\node[draw,rounded corners] (a) {Encoder};\n"
+            "  \\node[draw,rounded corners,right=of a] (b) {Policy};\n"
+            "  \\draw[->] (a) -- (b);\n"
+            "\\end{tikzpicture}"
+        )
+        return {
+            "id": "figure-latex",
+            "title": title,
+            "kind": "latex",
+            "latex": {"engine": "tikz", "source": source, "rendered_svg": None},
+            "meta": {
+                "source": "stub",
+                "note": "LaTeX 渲染后端尚未配置：已返回源码，接入后端编译为 SVG 后即可矢量显示。",
+            },
+        }
+
+    if mode == "image":
+        # 不透明浅色面板，保证在深/浅两种卡片背景下文字都清晰可读
+        placeholder = (
+            "<svg xmlns='http://www.w3.org/2000/svg' width='720' height='420'>"
+            "<defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'>"
+            "<stop offset='0' stop-color='#2dd4bf'/><stop offset='1' stop-color='#818cf8'/>"
+            "</linearGradient></defs>"
+            "<rect width='720' height='420' rx='18' fill='#eef2f7'/>"
+            "<rect width='720' height='12' rx='6' fill='url(#g)'/>"
+            "<rect x='1.5' y='1.5' width='717' height='417' rx='18' fill='none' stroke='#cbd5e1'/>"
+            "<text x='360' y='200' text-anchor='middle' font-size='28' font-weight='800' "
+            "fill='#1e293b' font-family='sans-serif'>图像生成占位</text>"
+            "<text x='360' y='242' text-anchor='middle' font-size='15' "
+            "fill='#475569' font-family='sans-serif'>image2 / 扩散模型接入后将替换为真实位图</text>"
+            "</svg>"
+        )
+        data_uri = "data:image/svg+xml;base64," + base64.b64encode(placeholder.encode("utf-8")).decode("ascii")
+        return {
+            "id": "figure-image",
+            "title": title,
+            "kind": "image",
+            "image": {"url": None, "data_uri": data_uri, "mime": "image/svg+xml", "alt": title},
+            "meta": {
+                "source": "stub",
+                "note": "图像生成模型尚未配置：当前返回占位图，接入后返回真实 PNG/URL。",
+            },
+        }
+
+    # 默认 svg：返回一张真实可缩放的矢量示例图
+    sample_svg = (
+        "<svg xmlns='http://www.w3.org/2000/svg' width='720' height='360' viewBox='0 0 720 360'>"
+        "<rect width='720' height='360' fill='#ffffff'/>"
+        "<text x='40' y='52' font-size='24' font-weight='800' fill='#0f172a' "
+        "font-family='sans-serif'>SVG 矢量示例</text>"
+        "<line x1='60' y1='300' x2='680' y2='300' stroke='#94a3b8' stroke-width='2'/>"
+        "<line x1='60' y1='90' x2='60' y2='300' stroke='#94a3b8' stroke-width='2'/>"
+        + "".join(
+            f"<rect x='{90 + i * 95}' y='{300 - h}' width='60' height='{h}' rx='6' "
+            f"fill='{'#0f766e' if i % 2 == 0 else '#818cf8'}'/>"
+            for i, h in enumerate([120, 168, 96, 204, 150, 186])
+        )
+        + "<text x='40' y='344' font-size='13' fill='#64748b' font-family='sans-serif'>"
+        "矢量图：可无损缩放、可下载 .svg</text>"
+        "</svg>"
+    )
+    return {
+        "id": "figure-svg",
+        "title": title,
+        "kind": "svg",
+        "svg": sample_svg,
+        "meta": {"source": "stub", "note": "内置 SVG 示例（规则生成，无需 LLM）。"},
+    }
+
+
+def build_gui_app(orchestrator: "ResearchOrchestrator") -> ThreadingHTTPServer:
+    workspace_dir = orchestrator.settings.workspace_dir
+
     class GuiHandler(BaseHTTPRequestHandler):
-        def _read_note_payload(self, note_path: str) -> Dict[str, Any]:
-            file_path = Path(note_path).expanduser()
-            if not note_path:
-                raise ValueError("missing path")
-            if not file_path.exists():
-                raise FileNotFoundError("note not found")
-            content = file_path.read_text(encoding="utf-8")
-            return {
-                "path": str(file_path),
-                "name": file_path.name,
-                "content": content,
-            }
+        # -------------------- 基础发送工具 -------------------- #
+        def _send_bytes(self, body: bytes, content_type: str, status: int = 200) -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
         def _send_json(self, payload: Dict[str, Any], status: int = 200) -> None:
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-        def _send_html(self, html: str, status: int = 200) -> None:
-            body = html.encode("utf-8")
-            self.send_response(status)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            self._send_bytes(body, "application/json; charset=utf-8", status)
 
         def _read_json_body(self) -> Dict[str, Any]:
             length = int(self.headers.get("Content-Length", "0"))
@@ -48,17 +165,54 @@ def build_gui_app(orchestrator: ResearchOrchestrator) -> ThreadingHTTPServer:
             raw = self.rfile.read(length).decode("utf-8")
             return json.loads(raw) if raw.strip() else {}
 
-        def log_message(self, format: str, *args) -> None:
+        def log_message(self, format: str, *args) -> None:  # 静音访问日志
             return
 
+        # -------------------- 资源分发 -------------------- #
+        def _serve_static(self, path: str) -> bool:
+            entry = _STATIC_ROUTES.get(path)
+            if not entry:
+                return False
+            filename, content_type = entry
+            file_path = (WEB_DIR / filename).resolve()
+            if not file_path.exists() or not file_path.is_file():
+                self._send_json({"ok": False, "error": f"missing static file: {filename}"}, status=404)
+                return True
+            self._send_bytes(file_path.read_bytes(), content_type)
+            return True
+
+        def _serve_asset(self, raw_path: str) -> None:
+            if not raw_path:
+                raise ValueError("missing asset path")
+            target = _resolve_within(workspace_dir, raw_path)
+            if not target.exists() or not target.is_file():
+                raise FileNotFoundError("asset not found")
+            content_type = _ASSET_CONTENT_TYPES.get(target.suffix.lower())
+            if content_type is None:
+                raise PermissionError(f"asset type not allowed: {target.suffix}")
+            self._send_bytes(target.read_bytes(), content_type)
+
+        def _read_note_payload(self, note_path: str) -> Dict[str, Any]:
+            if not note_path:
+                raise ValueError("missing path")
+            file_path = _resolve_within(workspace_dir, note_path)
+            if not file_path.exists():
+                raise FileNotFoundError("note not found")
+            return {
+                "path": str(file_path),
+                "name": file_path.name,
+                "dir": str(file_path.parent),
+                "content": file_path.read_text(encoding="utf-8"),
+            }
+
+        # -------------------- GET -------------------- #
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
             path = parsed.path
             query = parse_qs(parsed.query)
 
             try:
-                if path == "/":
-                    self._send_html(_build_index_html())
+                if self._serve_static(path):
                     return
                 if path == "/api/health":
                     self._send_json({"ok": True})
@@ -75,6 +229,9 @@ def build_gui_app(orchestrator: ResearchOrchestrator) -> ThreadingHTTPServer:
                     note_path = (query.get("path", [""])[0] or "").strip()
                     self._send_json({"ok": True, "data": self._read_note_payload(note_path)})
                     return
+                if path == "/api/asset":
+                    self._serve_asset((query.get("path", [""])[0] or "").strip())
+                    return
                 if path == "/api/graph":
                     keyword = (query.get("q", [""])[0] or "").strip()
                     snapshot = orchestrator.memory.get_paper_graph_snapshot(
@@ -88,11 +245,14 @@ def build_gui_app(orchestrator: ResearchOrchestrator) -> ThreadingHTTPServer:
                 self._send_json({"ok": False, "error": f"unknown path: {path}"}, status=404)
             except FileNotFoundError as exc:
                 self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=404)
+            except PermissionError as exc:
+                self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=403)
             except ValueError as exc:
                 self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=400)
             except Exception as exc:
                 self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=500)
 
+        # -------------------- POST -------------------- #
         def do_POST(self) -> None:
             parsed = urlparse(self.path)
             path = parsed.path
@@ -101,65 +261,20 @@ def build_gui_app(orchestrator: ResearchOrchestrator) -> ThreadingHTTPServer:
                 payload = self._read_json_body()
 
                 if path == "/api/search":
-                    query = str(payload.get("query", "")).strip()
-                    if not query:
-                        self._send_json({"ok": False, "error": "query is required"}, status=400)
-                        return
-                    papers = orchestrator.search_papers(query)
-                    data = [
-                        {
-                            "paper_id": p.paper_id,
-                            "title": p.title,
-                            "authors": p.authors,
-                            "abstract": p.abstract,
-                            "url": p.url,
-                            "published": p.published,
-                        }
-                        for p in papers
-                    ]
-                    self._send_json({"ok": True, "data": data})
+                    self._handle_search(payload)
                     return
-
                 if path == "/api/analyze":
-                    source = str(payload.get("source", "")).strip()
-                    focus = str(payload.get("focus", "")).strip() or None
-                    title = str(payload.get("title", "")).strip() or None
-                    mode = str(payload.get("mode", "read-paper")).strip()
-
-                    if not source:
-                        self._send_json({"ok": False, "error": "source is required"}, status=400)
-                        return
-
-                    possible_file = Path(source).expanduser()
-                    if possible_file.exists() and possible_file.is_file():
-                        result = orchestrator.analyzer.analyze_local_pdf(
-                            possible_file.resolve(),
-                            title=title,
-                            focus=focus,
-                        )
-                        display_title = title or orchestrator.analyzer.fetcher.infer_title_from_pdf(possible_file)
-                        self._send_json(
-                            {"ok": True, "data": {"title": display_title, "result": result, "local": True}}
-                        )
-                        return
-
-                    paper_id = source.rstrip("/").split("/")[-1].replace(".pdf", "")
-                    papers = orchestrator.arxiv.search(f"id:{paper_id}", max_results=1)
-                    if not papers:
-                        self._send_json({"ok": False, "error": "paper not found"}, status=404)
-                        return
-
-                    paper = papers[0]
-                    result = (
-                        orchestrator.analyze_paper_multimodal(paper, focus)
-                        if mode == "read-paper"
-                        else orchestrator.analyze_paper(paper, focus)
-                    )
-                    self._send_json(
-                        {"ok": True, "data": {"title": paper.title, "result": result, "local": False}}
-                    )
+                    self._handle_analyze(payload)
                     return
-
+                if path == "/api/survey":
+                    self._handle_survey(payload)
+                    return
+                if path == "/api/figure":
+                    mode = str(payload.get("mode", "svg")).strip()
+                    title = str(payload.get("title", "")).strip()
+                    spec = str(payload.get("spec", payload.get("prompt", "")) or "")
+                    self._send_json({"ok": True, "data": build_figure_stub(mode, title, spec)})
+                    return
                 if path == "/api/open-note":
                     note_path = str(payload.get("path", "")).strip()
                     self._send_json({"ok": True, "data": self._read_note_payload(note_path)})
@@ -168,15 +283,137 @@ def build_gui_app(orchestrator: ResearchOrchestrator) -> ThreadingHTTPServer:
                 self._send_json({"ok": False, "error": f"unknown path: {path}"}, status=404)
             except FileNotFoundError as exc:
                 self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=404)
+            except PermissionError as exc:
+                self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=403)
             except ValueError as exc:
                 self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=400)
             except Exception as exc:
                 self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=500)
 
+        # -------------------- 业务处理 -------------------- #
+        def _handle_search(self, payload: Dict[str, Any]) -> None:
+            query = str(payload.get("query", "")).strip()
+            if not query:
+                self._send_json({"ok": False, "error": "query is required"}, status=400)
+                return
+            papers = orchestrator.search_papers(query)
+            data = [
+                {
+                    "paper_id": p.paper_id,
+                    "title": p.title,
+                    "authors": p.authors,
+                    "abstract": p.abstract,
+                    "url": p.url,
+                    "published": p.published,
+                }
+                for p in papers
+            ]
+            self._send_json({"ok": True, "data": data})
+
+        def _handle_analyze(self, payload: Dict[str, Any]) -> None:
+            source = str(payload.get("source", "")).strip()
+            focus = str(payload.get("focus", "")).strip() or None
+            title = str(payload.get("title", "")).strip() or None
+            mode = str(payload.get("mode", "read-paper")).strip()
+
+            if not source:
+                self._send_json({"ok": False, "error": "source is required"}, status=400)
+                return
+
+            possible_file = Path(source).expanduser()
+            if possible_file.exists() and possible_file.is_file():
+                result = orchestrator.analyzer.analyze_local_pdf(
+                    possible_file.resolve(), title=title, focus=focus
+                )
+                display_title = title or orchestrator.analyzer.fetcher.infer_title_from_pdf(possible_file)
+                self._send_json(
+                    {"ok": True, "data": {"title": display_title, "result": result, "local": True}}
+                )
+                return
+
+            paper_id = source.rstrip("/").split("/")[-1].replace(".pdf", "")
+            papers = orchestrator.arxiv.search(f"id:{paper_id}", max_results=1)
+            if not papers:
+                self._send_json({"ok": False, "error": "paper not found"}, status=404)
+                return
+
+            paper = papers[0]
+            result = (
+                orchestrator.analyze_paper_multimodal(paper, focus)
+                if mode == "read-paper"
+                else orchestrator.analyze_paper(paper, focus)
+            )
+            self._send_json(
+                {"ok": True, "data": {"title": paper.title, "result": result, "local": False}}
+            )
+
+        def _handle_survey(self, payload: Dict[str, Any]) -> None:
+            topic = str(payload.get("topic", "")).strip()
+            if not topic:
+                self._send_json({"ok": False, "error": "topic is required"}, status=400)
+                return
+            try:
+                max_papers = int(payload.get("max_papers", 12) or 12)
+            except (TypeError, ValueError):
+                max_papers = 12
+            max_papers = max(3, min(30, max_papers))
+
+            from .services.survey_builder import SurveyBuilder
+
+            builder = SurveyBuilder(workspace_dir)
+            artifact = builder.build(topic, max_papers=max_papers)
+
+            timeline_svg = Path(artifact.timeline_file).read_text(encoding="utf-8")
+            poster_svg = Path(artifact.poster_file).read_text(encoding="utf-8")
+            report_md = Path(artifact.report_file).read_text(encoding="utf-8")
+
+            figures = [
+                {
+                    "id": "timeline",
+                    "title": "算法发展演进图",
+                    "kind": "svg",
+                    "svg": timeline_svg,
+                    "download_path": artifact.timeline_file,
+                    "meta": {"source": "survey_timeline", "note": "按发布日期排序，绿色节点表示发现公开代码。"},
+                },
+                {
+                    "id": "poster",
+                    "title": "综述海报",
+                    "kind": "svg",
+                    "svg": poster_svg,
+                    "download_path": artifact.poster_file,
+                    "meta": {"source": "survey_poster", "note": "证据优先、公开代码优先的综述海报。"},
+                },
+            ]
+            papers = [
+                {
+                    "title": p.title,
+                    "year": (p.published or p.updated or "")[:4],
+                    "url": p.url,
+                    "code_url": p.code_url,
+                    "has_code": p.has_code,
+                }
+                for p in artifact.papers
+            ]
+            self._send_json(
+                {
+                    "ok": True,
+                    "data": {
+                        "topic": topic,
+                        "output_dir": artifact.output_dir,
+                        "report_md": report_md,
+                        "report_path": artifact.report_file,
+                        "raw_data_file": artifact.raw_data_file,
+                        "papers": papers,
+                        "figures": figures,
+                    },
+                }
+            )
+
     return ThreadingHTTPServer(("127.0.0.1", 0), GuiHandler)
 
 
-def launch_gui(orchestrator: ResearchOrchestrator, open_browser: bool = True) -> str:
+def launch_gui(orchestrator: "ResearchOrchestrator", open_browser: bool = True) -> str:
     server = build_gui_app(orchestrator)
     host, port = server.server_address
     url = f"http://{host}:{port}"
@@ -191,1388 +428,3 @@ def launch_gui(orchestrator: ResearchOrchestrator, open_browser: bool = True) ->
             pass
 
     return url
-
-
-def _build_index_html() -> str:
-    return r"""<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Deep Research Agent GUI</title>
-  <style>
-    :root {
-      --bg: #f4efe7;
-      --panel: rgba(255, 252, 247, 0.86);
-      --panel-strong: #fffdf8;
-      --ink: #1e1c18;
-      --muted: #70685f;
-      --line: rgba(65, 52, 37, 0.16);
-      --brand: #0f766e;
-      --brand-2: #c2410c;
-      --accent: #164e63;
-      --good: #166534;
-      --bad: #b91c1c;
-      --shadow: 0 22px 50px rgba(59, 39, 23, 0.12);
-      --radius: 22px;
-      --mono: "JetBrains Mono", "Consolas", monospace;
-      --sans: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
-    }
-
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      font-family: var(--sans);
-      color: var(--ink);
-      background:
-        radial-gradient(circle at top left, rgba(15, 118, 110, 0.12), transparent 30%),
-        radial-gradient(circle at top right, rgba(194, 65, 12, 0.10), transparent 28%),
-        linear-gradient(180deg, #f8f2e8 0%, #efe6d8 100%);
-      min-height: 100vh;
-    }
-
-    .shell {
-      max-width: 1520px;
-      margin: 0 auto;
-      padding: 28px 18px 48px;
-    }
-
-    .hero {
-      display: grid;
-      grid-template-columns: 1.2fr 0.8fr;
-      gap: 18px;
-      margin-bottom: 18px;
-    }
-
-    .card {
-      background: var(--panel);
-      backdrop-filter: blur(10px);
-      border: 1px solid var(--line);
-      border-radius: var(--radius);
-      box-shadow: var(--shadow);
-    }
-
-    .hero-main {
-      padding: 26px 28px;
-      min-height: 170px;
-      position: relative;
-      overflow: hidden;
-    }
-
-    .hero-main::after {
-      content: "";
-      position: absolute;
-      right: -40px;
-      top: -40px;
-      width: 180px;
-      height: 180px;
-      border-radius: 50%;
-      background: radial-gradient(circle, rgba(15, 118, 110, 0.22), transparent 70%);
-    }
-
-    h1 {
-      margin: 0 0 10px;
-      font-size: clamp(28px, 3vw, 46px);
-      line-height: 1.02;
-      letter-spacing: -0.03em;
-    }
-
-    .hero-main p {
-      margin: 0;
-      max-width: 760px;
-      font-size: 15px;
-      line-height: 1.7;
-      color: var(--muted);
-    }
-
-    .hero-side {
-      padding: 22px;
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 12px;
-      align-content: start;
-    }
-
-    .metric {
-      background: rgba(255,255,255,0.62);
-      border: 1px solid rgba(22, 78, 99, 0.10);
-      border-radius: 18px;
-      padding: 16px;
-      min-height: 94px;
-      transition: transform 180ms ease, background 180ms ease;
-    }
-
-    .metric:hover {
-      transform: translateY(-2px);
-      background: rgba(255,255,255,0.78);
-    }
-
-    .metric .label {
-      color: var(--muted);
-      font-size: 12px;
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
-    }
-
-    .metric .value {
-      margin-top: 10px;
-      font-size: 28px;
-      font-weight: 700;
-    }
-
-    .layout {
-      display: grid;
-      grid-template-columns: 440px minmax(0, 1fr);
-      gap: 18px;
-      align-items: start;
-    }
-
-    .stack {
-      display: grid;
-      gap: 18px;
-    }
-
-    .panel {
-      padding: 18px;
-    }
-
-    .panel h2 {
-      margin: 0 0 14px;
-      font-size: 20px;
-    }
-
-    .panel h3 {
-      margin: 8px 0 10px;
-      font-size: 14px;
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
-      color: var(--muted);
-    }
-
-    .controls {
-      display: grid;
-      gap: 12px;
-    }
-
-    label {
-      display: block;
-      font-size: 13px;
-      color: var(--muted);
-      margin-bottom: 6px;
-    }
-
-    input, textarea, select, button {
-      font: inherit;
-    }
-
-    input, textarea, select {
-      width: 100%;
-      border: 1px solid rgba(30, 28, 24, 0.12);
-      background: rgba(255, 255, 255, 0.82);
-      border-radius: 14px;
-      padding: 12px 14px;
-      color: var(--ink);
-      transition: border-color 160ms ease, box-shadow 160ms ease;
-    }
-
-    input:focus, textarea:focus, select:focus {
-      outline: none;
-      border-color: rgba(15, 118, 110, 0.52);
-      box-shadow: 0 0 0 4px rgba(15, 118, 110, 0.10);
-    }
-
-    textarea {
-      min-height: 86px;
-      resize: vertical;
-      line-height: 1.6;
-    }
-
-    .button-row {
-      display: flex;
-      gap: 10px;
-      flex-wrap: wrap;
-    }
-
-    button {
-      border: none;
-      border-radius: 999px;
-      padding: 11px 16px;
-      cursor: pointer;
-      transition: transform 160ms ease, opacity 160ms ease, box-shadow 160ms ease;
-      box-shadow: 0 10px 18px rgba(15, 118, 110, 0.15);
-    }
-
-    button:hover {
-      transform: translateY(-1px);
-    }
-
-    button:disabled {
-      opacity: 0.6;
-      cursor: wait;
-      transform: none;
-    }
-
-    .btn-primary {
-      background: linear-gradient(135deg, var(--brand), var(--accent));
-      color: white;
-    }
-
-    .btn-secondary {
-      background: linear-gradient(135deg, #f59e0b, var(--brand-2));
-      color: white;
-    }
-
-    .btn-ghost {
-      background: rgba(255,255,255,0.8);
-      color: var(--ink);
-      box-shadow: none;
-      border: 1px solid rgba(30, 28, 24, 0.1);
-    }
-
-    .status {
-      min-height: 24px;
-      font-size: 13px;
-      color: var(--muted);
-    }
-
-    .status.good { color: var(--good); }
-    .status.bad { color: var(--bad); }
-
-    .results {
-      display: grid;
-      gap: 18px;
-    }
-
-    .paper-list, .note-list {
-      display: grid;
-      gap: 10px;
-      max-height: 300px;
-      overflow: auto;
-      padding-right: 4px;
-    }
-
-    .paper-item, .note-item {
-      border: 1px solid rgba(22, 78, 99, 0.10);
-      border-radius: 16px;
-      padding: 14px;
-      background: rgba(255,255,255,0.62);
-      transition: transform 160ms ease, background 160ms ease;
-    }
-
-    .paper-item:hover, .note-item:hover {
-      transform: translateY(-1px);
-      background: rgba(255,255,255,0.8);
-    }
-
-    .paper-item .title, .note-item .title {
-      font-weight: 700;
-      margin-bottom: 8px;
-      line-height: 1.45;
-    }
-
-    .mini {
-      color: var(--muted);
-      font-size: 12px;
-      line-height: 1.5;
-    }
-
-    .analysis-grid {
-      display: grid;
-      grid-template-columns: 1.2fr 0.8fr;
-      gap: 18px;
-      align-items: start;
-    }
-
-    .analysis-body {
-      background: var(--panel-strong);
-      border: 1px solid var(--line);
-      border-radius: 18px;
-      padding: 18px;
-      line-height: 1.8;
-      white-space: pre-wrap;
-      min-height: 520px;
-      overflow: auto;
-    }
-
-    .markdown-body {
-      white-space: normal;
-      line-height: 1.8;
-    }
-
-    .markdown-body h1,
-    .markdown-body h2,
-    .markdown-body h3,
-    .markdown-body h4,
-    .markdown-body h5,
-    .markdown-body h6 {
-      line-height: 1.35;
-      margin: 1.1em 0 0.55em;
-    }
-
-    .markdown-body h1 { font-size: 30px; }
-    .markdown-body h2 {
-      font-size: 24px;
-      padding-bottom: 6px;
-      border-bottom: 1px solid rgba(30, 28, 24, 0.10);
-    }
-    .markdown-body h3 { font-size: 20px; }
-    .markdown-body h4 { font-size: 17px; }
-
-    .markdown-body p,
-    .markdown-body ul,
-    .markdown-body ol,
-    .markdown-body blockquote,
-    .markdown-body table,
-    .markdown-body pre {
-      margin: 0 0 1em;
-    }
-
-    .markdown-body ul,
-    .markdown-body ol {
-      padding-left: 1.5em;
-    }
-
-    .markdown-body li {
-      margin: 0.3em 0;
-    }
-
-    .markdown-body blockquote {
-      margin-left: 0;
-      padding: 0.4em 1em;
-      border-left: 4px solid rgba(15, 118, 110, 0.35);
-      background: rgba(15, 118, 110, 0.06);
-      color: #4b5563;
-      border-radius: 0 12px 12px 0;
-    }
-
-    .markdown-body code {
-      font-family: var(--mono);
-      font-size: 0.94em;
-      padding: 0.12em 0.34em;
-      border-radius: 6px;
-      background: rgba(22, 78, 99, 0.08);
-    }
-
-    .markdown-body pre {
-      overflow: auto;
-      padding: 14px 16px;
-      border-radius: 14px;
-      background: #1f2937;
-      color: #f9fafb;
-    }
-
-    .markdown-body pre code {
-      padding: 0;
-      background: transparent;
-      color: inherit;
-    }
-
-    .markdown-body table {
-      width: 100%;
-      border-collapse: collapse;
-      font-size: 14px;
-      overflow: hidden;
-      border-radius: 12px;
-      border: 1px solid rgba(30, 28, 24, 0.10);
-    }
-
-    .markdown-body th,
-    .markdown-body td {
-      padding: 10px 12px;
-      border-bottom: 1px solid rgba(30, 28, 24, 0.08);
-      border-right: 1px solid rgba(30, 28, 24, 0.06);
-      text-align: left;
-      vertical-align: top;
-    }
-
-    .markdown-body th:last-child,
-    .markdown-body td:last-child {
-      border-right: none;
-    }
-
-    .markdown-body thead {
-      background: rgba(15, 118, 110, 0.08);
-    }
-
-    .markdown-body img {
-      max-width: 100%;
-      height: auto;
-      display: block;
-      margin: 12px 0;
-      border-radius: 14px;
-      box-shadow: 0 12px 30px rgba(30, 28, 24, 0.10);
-    }
-
-    .markdown-body hr {
-      border: none;
-      border-top: 1px solid rgba(30, 28, 24, 0.12);
-      margin: 1.4em 0;
-    }
-
-    .markdown-body a {
-      color: var(--brand);
-      text-decoration: none;
-    }
-
-    .markdown-body a:hover {
-      text-decoration: underline;
-    }
-
-    .analysis-side {
-      display: grid;
-      gap: 14px;
-    }
-
-    .side-box {
-      background: rgba(255,255,255,0.62);
-      border: 1px solid rgba(22, 78, 99, 0.10);
-      border-radius: 18px;
-      padding: 16px;
-    }
-
-    .side-box ul {
-      margin: 0;
-      padding-left: 18px;
-    }
-
-    .side-box li {
-      margin: 6px 0;
-      line-height: 1.6;
-    }
-
-    .graph-wrap {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) 300px;
-      gap: 18px;
-      align-items: start;
-    }
-
-    .graph-surface {
-      position: relative;
-      min-height: 680px;
-      background:
-        radial-gradient(circle at center, rgba(255,255,255,0.85), rgba(248, 244, 237, 0.92));
-      border: 1px solid var(--line);
-      border-radius: 20px;
-      overflow: hidden;
-    }
-
-    .graph-stage {
-      width: 100%;
-      height: 680px;
-      display: block;
-      cursor: grab;
-    }
-
-    .graph-stage:active {
-      cursor: grabbing;
-    }
-
-    .graph-toolbar {
-      position: absolute;
-      left: 14px;
-      top: 14px;
-      display: flex;
-      gap: 8px;
-      z-index: 2;
-    }
-
-    .graph-toolbar button {
-      padding: 8px 12px;
-      border-radius: 999px;
-      box-shadow: none;
-      background: rgba(255,255,255,0.88);
-    }
-
-    .graph-info {
-      display: grid;
-      gap: 12px;
-      align-content: start;
-    }
-
-    .legend {
-      display: grid;
-      gap: 10px;
-      font-size: 13px;
-    }
-
-    .legend-item {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      color: var(--muted);
-    }
-
-    .dot {
-      width: 14px;
-      height: 14px;
-      border-radius: 50%;
-      display: inline-block;
-    }
-
-    .pill {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      padding: 5px 10px;
-      border-radius: 999px;
-      background: rgba(15, 118, 110, 0.10);
-      color: var(--brand);
-      font-size: 12px;
-      font-weight: 600;
-    }
-
-    .codebox {
-      font-family: var(--mono);
-      font-size: 12px;
-      white-space: pre-wrap;
-      line-height: 1.7;
-      background: rgba(255,255,255,0.62);
-      border-radius: 14px;
-      padding: 12px;
-      border: 1px solid rgba(22, 78, 99, 0.08);
-    }
-
-    .empty {
-      color: var(--muted);
-      font-size: 14px;
-      padding: 20px 0 8px;
-    }
-
-    @media (max-width: 1180px) {
-      .layout, .analysis-grid, .graph-wrap, .hero {
-        grid-template-columns: 1fr;
-      }
-
-      .graph-info {
-        order: -1;
-      }
-    }
-
-    @media (max-width: 760px) {
-      .hero-side {
-        grid-template-columns: 1fr 1fr;
-      }
-
-      .shell {
-        padding: 18px 12px 28px;
-      }
-
-      .panel, .hero-main, .hero-side {
-        padding: 16px;
-      }
-    }
-  </style>
-</head>
-<body>
-  <div class="shell">
-    <section class="hero">
-      <div class="card hero-main">
-        <h1>Deep Research Agent<br/>Paper Workspace</h1>
-        <p>把论文搜索、保守版分析、多模态细读、已读笔记浏览和论文图关系可视化放到同一个本地页面里。左侧负责输入和调用，右侧负责结果和图谱，让你更像是在操作一个“研究工作台”，而不是一堆零散命令。</p>
-      </div>
-      <div class="card hero-side">
-        <div class="metric">
-          <div class="label">Paper Nodes</div>
-          <div class="value" id="metric-nodes">-</div>
-        </div>
-        <div class="metric">
-          <div class="label">Paper Edges</div>
-          <div class="value" id="metric-edges">-</div>
-        </div>
-        <div class="metric">
-          <div class="label">Episodes</div>
-          <div class="value" id="metric-episodes">-</div>
-        </div>
-        <div class="metric">
-          <div class="label">Vectors</div>
-          <div class="value" id="metric-vectors">-</div>
-        </div>
-      </div>
-    </section>
-
-    <section class="layout">
-      <div class="stack">
-        <div class="card panel">
-          <h2>论文工作台</h2>
-          <div class="controls">
-            <div>
-              <label for="source">论文来源</label>
-              <input id="source" placeholder="本地 PDF 路径，或 arXiv ID / 链接" />
-            </div>
-            <div>
-              <label for="title">本地 PDF 可选标题</label>
-              <input id="title" placeholder="仅本地 PDF 需要时填写" />
-            </div>
-            <div>
-              <label for="focus">关注点</label>
-              <textarea id="focus" placeholder="例如：方法细节、实验设置、和已有 VLA 工作的关系"></textarea>
-            </div>
-            <div>
-              <label for="mode">分析模式</label>
-              <select id="mode">
-                <option value="read-paper">read-paper 多模态/细读</option>
-                <option value="analyze">analyze 保守版</option>
-              </select>
-            </div>
-            <div class="button-row">
-              <button class="btn-primary" id="btn-analyze">开始分析</button>
-              <button class="btn-ghost" id="btn-load-graph">刷新图谱</button>
-              <button class="btn-ghost" id="btn-load-notes">刷新笔记</button>
-            </div>
-            <div class="status" id="action-status"></div>
-          </div>
-        </div>
-
-        <div class="card panel">
-          <h2>论文搜索</h2>
-          <div class="controls">
-            <div>
-              <label for="search-query">关键词</label>
-              <input id="search-query" placeholder="例如：latent world model for robot policy" />
-            </div>
-            <div class="button-row">
-              <button class="btn-secondary" id="btn-search">搜索论文</button>
-            </div>
-            <div class="status" id="search-status"></div>
-            <div class="paper-list" id="search-results"></div>
-          </div>
-        </div>
-
-        <div class="card panel">
-          <h2>已读笔记</h2>
-          <div class="controls">
-            <div>
-              <label for="notes-query">筛选关键词</label>
-              <input id="notes-query" placeholder="留空则按最新笔记显示" />
-            </div>
-            <div class="button-row">
-              <button class="btn-ghost" id="btn-filter-notes">筛选笔记</button>
-            </div>
-            <div class="note-list" id="note-results"></div>
-          </div>
-        </div>
-      </div>
-
-      <div class="stack results">
-        <div class="card panel">
-          <h2>分析结果</h2>
-          <div class="analysis-grid">
-            <div class="analysis-body" id="analysis-output">这里会显示论文分析、保存路径和正文摘要。</div>
-            <div class="analysis-side">
-              <div class="side-box">
-                <h3>主要贡献</h3>
-                <ul id="analysis-contribs"><li>等待分析结果</li></ul>
-              </div>
-              <div class="side-box">
-                <h3>数据集</h3>
-                <ul id="analysis-datasets"><li>等待分析结果</li></ul>
-              </div>
-              <div class="side-box">
-                <h3>记忆连接</h3>
-                <ul id="analysis-memory"><li>等待分析结果</li></ul>
-              </div>
-              <div class="side-box">
-                <h3>引用中的相似工作</h3>
-                <ul id="analysis-related"><li>等待分析结果</li></ul>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <div class="card panel">
-          <h2>论文图关系可视化</h2>
-          <div class="controls" style="margin-bottom: 14px;">
-            <div>
-              <label for="graph-query">图谱检索词</label>
-              <input id="graph-query" placeholder="例如：VLA / DPO / 世界模型，留空显示最近节点" />
-            </div>
-            <div class="button-row">
-              <button class="btn-primary" id="btn-query-graph">查询图谱</button>
-            </div>
-          </div>
-
-          <div class="graph-wrap">
-            <div class="graph-surface">
-              <div class="graph-toolbar">
-                <button type="button" id="btn-zoom-in">放大</button>
-                <button type="button" id="btn-zoom-out">缩小</button>
-                <button type="button" id="btn-reset-graph">重置</button>
-              </div>
-              <svg class="graph-stage" id="graph-stage" viewBox="0 0 980 680"></svg>
-            </div>
-            <div class="graph-info">
-              <div class="side-box">
-                <h3>图谱说明</h3>
-                <div class="legend">
-                  <div class="legend-item"><span class="dot" style="background:#0f766e;"></span> 已读论文节点</div>
-                  <div class="legend-item"><span class="dot" style="background:#b45309;"></span> 引用占位节点</div>
-                  <div class="legend-item"><span class="dot" style="background:#164e63;"></span> `builds_on`</div>
-                  <div class="legend-item"><span class="dot" style="background:#c2410c;"></span> `compares_with`</div>
-                  <div class="legend-item"><span class="dot" style="background:#6b7280;"></span> `similar_to`</div>
-                </div>
-              </div>
-              <div class="side-box">
-                <h3>选中节点</h3>
-                <div id="graph-node-detail" class="empty">点击图中的节点查看详情。</div>
-              </div>
-              <div class="side-box">
-                <h3>图谱统计</h3>
-                <div class="codebox" id="graph-stats">等待加载</div>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <div class="card panel">
-          <h2>笔记查看器</h2>
-          <div class="analysis-body" id="note-viewer">这里会显示选中笔记的原始 Markdown。</div>
-        </div>
-      </div>
-    </section>
-  </div>
-
-  <script>
-    const state = {
-      graph: { nodes: [], edges: [], zoom: 1, panX: 0, panY: 0, positions: {} },
-      drag: null,
-      graphDrag: null,
-    };
-
-    const $ = (id) => document.getElementById(id);
-
-    function setStatus(id, text, kind = "") {
-      const el = $(id);
-      el.textContent = text || "";
-      el.className = "status" + (kind ? " " + kind : "");
-    }
-
-    async function apiGet(url) {
-      const res = await fetch(url);
-      const data = await res.json();
-      if (!res.ok || !data.ok) {
-        throw new Error(data.error || "request failed");
-      }
-      return data.data;
-    }
-
-    async function apiPost(url, payload) {
-      const res = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      const data = await res.json();
-      if (!res.ok || !data.ok) {
-        throw new Error(data.error || "request failed");
-      }
-      return data.data;
-    }
-
-    function escapeHtml(text) {
-      const div = document.createElement("div");
-      div.textContent = text == null ? "" : String(text);
-      return div.innerHTML;
-    }
-
-    function renderInlineMarkdown(text) {
-      let html = escapeHtml(text || "");
-      html = html.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, '<img alt="$1" src="$2" />');
-      html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>');
-      html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
-      html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
-      html = html.replace(/__([^_]+)__/g, '<strong>$1</strong>');
-      html = html.replace(/(?<!\*)\*([^*\n]+)\*(?!\*)/g, '<em>$1</em>');
-      html = html.replace(/(?<!_)_([^_\n]+)_(?!_)/g, '<em>$1</em>');
-      return html;
-    }
-
-    function isTableSeparator(line) {
-      return /^\|?(\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?$/.test((line || "").trim());
-    }
-
-    function splitTableRow(line) {
-      return (line || "")
-        .trim()
-        .replace(/^\|/, "")
-        .replace(/\|$/, "")
-        .split("|")
-        .map((cell) => renderInlineMarkdown(cell.trim()));
-    }
-
-    function renderMarkdown(markdown) {
-      const lines = String(markdown || "").replace(/\r\n/g, "\n").split("\n");
-      const blocks = [];
-      let i = 0;
-
-      while (i < lines.length) {
-        const raw = lines[i];
-        const line = raw.trim();
-
-        if (!line) {
-          i += 1;
-          continue;
-        }
-
-        if (raw.startsWith("```")) {
-          const fence = raw.slice(3).trim();
-          const codeLines = [];
-          i += 1;
-          while (i < lines.length && !lines[i].startsWith("```")) {
-            codeLines.push(lines[i]);
-            i += 1;
-          }
-          if (i < lines.length) i += 1;
-          blocks.push(
-            `<pre><code class="${escapeHtml(fence)}">${escapeHtml(codeLines.join("\n"))}</code></pre>`
-          );
-          continue;
-        }
-
-        if (/^#{1,6}\s+/.test(line)) {
-          const level = line.match(/^#+/)[0].length;
-          blocks.push(`<h${level}>${renderInlineMarkdown(line.slice(level).trim())}</h${level}>`);
-          i += 1;
-          continue;
-        }
-
-        if (/^---+$/.test(line) || /^\*\*\*+$/.test(line)) {
-          blocks.push("<hr />");
-          i += 1;
-          continue;
-        }
-
-        if (lines[i].includes("|") && i + 1 < lines.length && isTableSeparator(lines[i + 1])) {
-          const headers = splitTableRow(lines[i]);
-          i += 2;
-          const rows = [];
-          while (i < lines.length && lines[i].trim().includes("|")) {
-            rows.push(splitTableRow(lines[i]));
-            i += 1;
-          }
-          blocks.push(
-            "<table><thead><tr>" +
-            headers.map((cell) => `<th>${cell}</th>`).join("") +
-            "</tr></thead><tbody>" +
-            rows.map((row) => "<tr>" + row.map((cell) => `<td>${cell}</td>`).join("") + "</tr>").join("") +
-            "</tbody></table>"
-          );
-          continue;
-        }
-
-        if (/^>\s?/.test(line)) {
-          const quoteLines = [];
-          while (i < lines.length && /^>\s?/.test(lines[i].trim())) {
-            quoteLines.push(renderInlineMarkdown(lines[i].trim().replace(/^>\s?/, "")));
-            i += 1;
-          }
-          blocks.push(`<blockquote>${quoteLines.join("<br />")}</blockquote>`);
-          continue;
-        }
-
-        if (/^[-*+]\s+/.test(line)) {
-          const items = [];
-          while (i < lines.length && /^[-*+]\s+/.test(lines[i].trim())) {
-            items.push(`<li>${renderInlineMarkdown(lines[i].trim().replace(/^[-*+]\s+/, ""))}</li>`);
-            i += 1;
-          }
-          blocks.push(`<ul>${items.join("")}</ul>`);
-          continue;
-        }
-
-        if (/^\d+\.\s+/.test(line)) {
-          const items = [];
-          while (i < lines.length && /^\d+\.\s+/.test(lines[i].trim())) {
-            items.push(`<li>${renderInlineMarkdown(lines[i].trim().replace(/^\d+\.\s+/, ""))}</li>`);
-            i += 1;
-          }
-          blocks.push(`<ol>${items.join("")}</ol>`);
-          continue;
-        }
-
-        const paragraph = [];
-        while (i < lines.length) {
-          const current = lines[i];
-          const currentTrimmed = current.trim();
-          if (
-            !currentTrimmed ||
-            current.startsWith("```") ||
-            /^#{1,6}\s+/.test(currentTrimmed) ||
-            /^>\s?/.test(currentTrimmed) ||
-            /^[-*+]\s+/.test(currentTrimmed) ||
-            /^\d+\.\s+/.test(currentTrimmed) ||
-            /^---+$/.test(currentTrimmed) ||
-            /^\*\*\*+$/.test(currentTrimmed) ||
-            (current.includes("|") && i + 1 < lines.length && isTableSeparator(lines[i + 1]))
-          ) {
-            break;
-          }
-          paragraph.push(renderInlineMarkdown(currentTrimmed));
-          i += 1;
-        }
-        blocks.push(`<p>${paragraph.join("<br />")}</p>`);
-      }
-
-      return blocks.join("\n");
-    }
-
-    function formatList(items, emptyText) {
-      if (!items || !items.length) {
-        return "<li>" + escapeHtml(emptyText) + "</li>";
-      }
-      return items.map((item) => "<li>" + escapeHtml(typeof item === "string" ? item : JSON.stringify(item)) + "</li>").join("");
-    }
-
-    function renderAnalysis(data) {
-      const title = data.title || "";
-      const result = data.result || {};
-      const content = [
-        "标题: " + title,
-        "分析模式: " + (result._analysis_mode || ""),
-        "来源: " + (result._source || ""),
-        result._note_path ? "笔记路径: " + result._note_path : "",
-        "",
-        "一句话总结:",
-        result.tldr || "",
-        "",
-        "核心问题:",
-        result.problem || "",
-        "",
-        "方法概述:",
-        result.method_summary || "",
-        "",
-        "实验结果:",
-        result.results || "",
-        "",
-        "未来方向:",
-        result.future_work || "",
-      ].filter(Boolean).join("\\n");
-
-      $("analysis-output").textContent = content;
-      $("analysis-contribs").innerHTML = formatList(result.contributions || [], "暂无");
-      $("analysis-datasets").innerHTML = formatList(
-        (result.datasets || []).map((item) => {
-          if (typeof item === "string") return item;
-          const name = item.name || "Unknown";
-          const usedFor = item.used_for ? " / " + item.used_for : "";
-          const size = item.size ? " / " + item.size : "";
-          return name + usedFor + size;
-        }),
-        "暂无"
-      );
-      $("analysis-memory").innerHTML = formatList(
-        (result.memory_connections || []).map((item) => {
-          return (item.title || "Unknown") + " | " + (item.relation || "") + " | 置信度 " + Number(item.confidence || 0).toFixed(2);
-        }),
-        "暂无高置信度记忆连接"
-      );
-      $("analysis-related").innerHTML = formatList(
-        (result.cited_similar_work || []).map((item) => {
-          if (typeof item === "string") return item;
-          return (item.title || "Unknown") + (item.category ? " [" + item.category + "]" : "");
-        }),
-        "暂无"
-      );
-    }
-
-    function renderSearchResults(items) {
-      const host = $("search-results");
-      if (!items.length) {
-        host.innerHTML = '<div class="empty">没有搜到结果。</div>';
-        return;
-      }
-      host.innerHTML = items.map((item) => `
-        <div class="paper-item">
-          <div class="title">${escapeHtml(item.title || "")}</div>
-          <div class="mini">${escapeHtml((item.authors || []).slice(0, 4).join(", "))}</div>
-          <div class="mini" style="margin-top:8px;">${escapeHtml((item.abstract || "").slice(0, 260))}</div>
-          <div class="button-row" style="margin-top:10px;">
-            <button class="btn-ghost js-fill-paper"
-                    data-url="${escapeHtml(item.url || "")}"
-                    data-title="${escapeHtml(item.title || "")}">填入阅读框</button>
-            <button class="btn-ghost js-open-link"
-                    data-url="${escapeHtml(item.url || "")}">打开链接</button>
-          </div>
-        </div>
-      `).join("");
-
-      host.querySelectorAll(".js-fill-paper").forEach((button) => {
-        button.addEventListener("click", () => {
-          fillPaperSource(button.dataset.url || "", button.dataset.title || "");
-        });
-      });
-      host.querySelectorAll(".js-open-link").forEach((button) => {
-        button.addEventListener("click", () => {
-          const url = button.dataset.url || "";
-          if (url) window.open(url, "_blank");
-        });
-      });
-    }
-
-    function renderNotes(items) {
-      const host = $("note-results");
-      if (!items.length) {
-        host.innerHTML = '<div class="empty">没有匹配到笔记。</div>';
-        return;
-      }
-      host.innerHTML = items.map((item) => `
-        <div class="note-item">
-          <div class="title">${escapeHtml(item.title || "")}</div>
-          <div class="mini">${escapeHtml(item.path || "")}</div>
-          <div class="mini" style="margin-top:8px;">${escapeHtml((item.preview || "").slice(0, 220))}</div>
-          <div class="button-row" style="margin-top:10px;">
-            <button class="btn-ghost js-open-note"
-                    data-path="${escapeHtml(item.path || "")}">查看笔记</button>
-          </div>
-        </div>
-      `).join("");
-
-      host.querySelectorAll(".js-open-note").forEach((button) => {
-        button.addEventListener("click", async () => {
-          try {
-            await openNote(button.dataset.path || "");
-          } catch (err) {
-            setStatus("action-status", String(err.message || err), "bad");
-          }
-        });
-      });
-    }
-
-    function circleColor(node) {
-      return node.metadata && node.metadata.placeholder ? "#b45309" : "#0f766e";
-    }
-
-    function edgeColor(edge) {
-      if (edge.relation_type === "builds_on") return "#164e63";
-      if (edge.relation_type === "compares_with") return "#c2410c";
-      return "#6b7280";
-    }
-
-    function summarizeGraphStats(stats, nodes, edges) {
-      return [
-        "显示节点: " + nodes.length,
-        "显示边: " + edges.length,
-        "已存论文节点: " + (stats.paper_nodes ?? "-"),
-        "已存论文边: " + (stats.paper_edges ?? "-"),
-        "episodes: " + (stats.episodes ?? "-"),
-        "vectors: " + (stats.vectors ?? "-")
-      ].join("\\n");
-    }
-
-    function wrapTitle(text, max = 18) {
-      const source = text || "";
-      const lines = [];
-      for (let i = 0; i < source.length; i += max) {
-        lines.push(source.slice(i, i + max));
-      }
-      return lines.slice(0, 3);
-    }
-
-    function computeGraphLayout(nodes, width, height) {
-      const positions = {};
-      if (!nodes.length) return positions;
-      const cols = Math.max(2, Math.ceil(Math.sqrt(nodes.length)));
-      const gapX = width / (cols + 1);
-      const rows = Math.ceil(nodes.length / cols);
-      const gapY = height / (rows + 1);
-      nodes.forEach((node, index) => {
-        const col = index % cols;
-        const row = Math.floor(index / cols);
-        positions[node.paper_id] = {
-          x: (col + 1) * gapX,
-          y: (row + 1) * gapY + ((col % 2) ? 18 : -18),
-        };
-      });
-      return positions;
-    }
-
-    function renderGraph(snapshot) {
-      const svg = $("graph-stage");
-      const nodes = snapshot.nodes || [];
-      const edges = snapshot.edges || [];
-      state.graph.nodes = nodes;
-      state.graph.edges = edges;
-      if (!Object.keys(state.graph.positions).length || state.graph.lastQuery !== (snapshot.query || "")) {
-        state.graph.positions = computeGraphLayout(nodes, 920, 620);
-      }
-      state.graph.lastQuery = snapshot.query || "";
-
-      const positions = state.graph.positions;
-      const zoom = state.graph.zoom;
-      const panX = state.graph.panX;
-      const panY = state.graph.panY;
-
-      const edgeMarkup = edges.map((edge) => {
-        const a = positions[edge.src_paper_id];
-        const b = positions[edge.dst_paper_id];
-        if (!a || !b) return "";
-        const labelX = (a.x + b.x) / 2;
-        const labelY = (a.y + b.y) / 2;
-        return `
-          <g>
-            <line x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}"
-                  stroke="${edgeColor(edge)}" stroke-width="${1.4 + (edge.relation_strength || 0.5) * 1.6}"
-                  stroke-opacity="0.72" />
-            <text x="${labelX}" y="${labelY - 6}" text-anchor="middle"
-                  font-size="10" fill="${edgeColor(edge)}">${escapeHtml(edge.relation_type || "")}</text>
-          </g>
-        `;
-      }).join("");
-
-      const nodeMarkup = nodes.map((node) => {
-        const pos = positions[node.paper_id];
-        if (!pos) return "";
-        const lines = wrapTitle(node.method_name || node.title || node.paper_id);
-        return `
-          <g class="graph-node" data-node-id="${escapeHtml(node.paper_id)}" transform="translate(${pos.x}, ${pos.y})" style="cursor:pointer;">
-            <circle r="28" fill="${circleColor(node)}" fill-opacity="0.92" stroke="white" stroke-width="3"></circle>
-            <circle r="34" fill="none" stroke="${circleColor(node)}" stroke-opacity="0.18" stroke-width="10"></circle>
-            ${lines.map((line, idx) => `
-              <text x="0" y="${44 + idx * 13}" text-anchor="middle" font-size="11" fill="#1e1c18">${escapeHtml(line)}</text>
-            `).join("")}
-          </g>
-        `;
-      }).join("");
-
-      svg.innerHTML = `
-        <g transform="translate(${panX}, ${panY}) scale(${zoom})">
-          ${edgeMarkup}
-          ${nodeMarkup}
-        </g>
-      `;
-
-      svg.querySelectorAll(".graph-node").forEach((el) => {
-        el.addEventListener("click", (event) => {
-          event.stopPropagation();
-          const nodeId = el.getAttribute("data-node-id");
-          const node = state.graph.nodes.find((item) => item.paper_id === nodeId);
-          if (!node) return;
-          $("graph-node-detail").innerHTML = `
-            <div class="pill">${escapeHtml(node.method_name || "Paper")}</div>
-            <div style="margin-top:10px;font-weight:700;line-height:1.5;">${escapeHtml(node.title || "")}</div>
-            <div class="mini" style="margin-top:8px;">paper_id: ${escapeHtml(node.paper_id || "")}</div>
-            <div class="mini" style="margin-top:8px;">${escapeHtml(node.problem || node.tldr || "暂无摘要")}</div>
-            ${node.note_path ? `<div class="button-row" style="margin-top:10px;"><button class="btn-ghost js-open-note-from-graph" data-path="${escapeHtml(node.note_path)}">打开笔记</button></div>` : ""}
-          `;
-          const noteButton = $("graph-node-detail").querySelector(".js-open-note-from-graph");
-          if (noteButton) {
-            noteButton.addEventListener("click", async () => {
-              try {
-                await openNote(noteButton.dataset.path || "");
-              } catch (err) {
-                setStatus("action-status", String(err.message || err), "bad");
-              }
-            });
-          }
-        });
-        el.addEventListener("mousedown", (event) => {
-          event.stopPropagation();
-          const nodeId = el.getAttribute("data-node-id");
-          state.drag = {
-            nodeId,
-            startX: event.clientX,
-            startY: event.clientY,
-            original: { ...state.graph.positions[nodeId] },
-          };
-        });
-      });
-
-      $("graph-stats").textContent = summarizeGraphStats(snapshot.stats || {}, nodes, edges);
-    }
-
-    async function refreshStats() {
-      const stats = await apiGet("/api/stats");
-      $("metric-nodes").textContent = stats.paper_nodes ?? 0;
-      $("metric-edges").textContent = stats.paper_edges ?? 0;
-      $("metric-episodes").textContent = stats.episodes ?? 0;
-      $("metric-vectors").textContent = stats.vectors ?? 0;
-    }
-
-    async function loadNotes(query = "") {
-      const suffix = query ? "?q=" + encodeURIComponent(query) : "";
-      const data = await apiGet("/api/notes" + suffix);
-      renderNotes(data);
-    }
-
-    async function openNote(path) {
-      if (!path) {
-        throw new Error("笔记路径为空");
-      }
-      setStatus("action-status", "正在加载笔记...");
-      const data = await apiPost("/api/open-note", { path });
-      $("note-viewer").innerHTML = `<div class="markdown-body">${renderMarkdown(data.content || "")}</div>`;
-      $("note-viewer").scrollTop = 0;
-      $("note-viewer").scrollIntoView({ behavior: "smooth", block: "start" });
-      setStatus("action-status", "笔记已加载。", "good");
-    }
-    window.openNote = openNote;
-
-    function fillPaperSource(url, title) {
-      $("source").value = url || "";
-      if (!$("title").value) $("title").value = title || "";
-    }
-    window.fillPaperSource = fillPaperSource;
-
-    async function queryGraph() {
-      const q = $("graph-query").value.trim();
-      const data = await apiGet("/api/graph" + (q ? "?q=" + encodeURIComponent(q) : ""));
-      renderGraph(data);
-    }
-
-    async function runSearch() {
-      const query = $("search-query").value.trim();
-      if (!query) {
-        setStatus("search-status", "请先输入搜索关键词。", "bad");
-        return;
-      }
-      setStatus("search-status", "正在搜索论文...");
-      $("btn-search").disabled = true;
-      try {
-        const data = await apiPost("/api/search", { query });
-        renderSearchResults(data);
-        setStatus("search-status", "搜索完成，共 " + data.length + " 条结果。", "good");
-      } catch (err) {
-        setStatus("search-status", String(err.message || err), "bad");
-      } finally {
-        $("btn-search").disabled = false;
-      }
-    }
-
-    async function runAnalyze() {
-      const source = $("source").value.trim();
-      const title = $("title").value.trim();
-      const focus = $("focus").value.trim();
-      const mode = $("mode").value;
-      if (!source) {
-        setStatus("action-status", "请先输入论文来源。", "bad");
-        return;
-      }
-      setStatus("action-status", "正在分析，这一步可能需要几十秒到几分钟...");
-      $("btn-analyze").disabled = true;
-      try {
-        const data = await apiPost("/api/analyze", { source, title, focus, mode });
-        renderAnalysis(data);
-        setStatus("action-status", "分析完成，笔记和记忆已更新。", "good");
-        await refreshStats();
-        await loadNotes($("notes-query").value.trim());
-        if (!$("graph-query").value.trim()) {
-          $("graph-query").value = focus || title || source;
-        }
-        await queryGraph();
-      } catch (err) {
-        setStatus("action-status", String(err.message || err), "bad");
-      } finally {
-        $("btn-analyze").disabled = false;
-      }
-    }
-
-    function wireGraphInteractions() {
-      const svg = $("graph-stage");
-
-      svg.addEventListener("mousedown", (event) => {
-        if (event.target.closest(".graph-node")) return;
-        state.graphDrag = {
-          startX: event.clientX,
-          startY: event.clientY,
-          panX: state.graph.panX,
-          panY: state.graph.panY,
-        };
-      });
-
-      window.addEventListener("mousemove", (event) => {
-        if (state.drag) {
-          const dx = (event.clientX - state.drag.startX) / state.graph.zoom;
-          const dy = (event.clientY - state.drag.startY) / state.graph.zoom;
-          state.graph.positions[state.drag.nodeId] = {
-            x: state.drag.original.x + dx,
-            y: state.drag.original.y + dy,
-          };
-          renderGraph({ nodes: state.graph.nodes, edges: state.graph.edges, stats: {
-            paper_nodes: $("metric-nodes").textContent,
-            paper_edges: $("metric-edges").textContent,
-            episodes: $("metric-episodes").textContent,
-            vectors: $("metric-vectors").textContent,
-          }, query: state.graph.lastQuery || "" });
-          return;
-        }
-        if (state.graphDrag) {
-          state.graph.panX = state.graphDrag.panX + (event.clientX - state.graphDrag.startX);
-          state.graph.panY = state.graphDrag.panY + (event.clientY - state.graphDrag.startY);
-          renderGraph({ nodes: state.graph.nodes, edges: state.graph.edges, stats: {
-            paper_nodes: $("metric-nodes").textContent,
-            paper_edges: $("metric-edges").textContent,
-            episodes: $("metric-episodes").textContent,
-            vectors: $("metric-vectors").textContent,
-          }, query: state.graph.lastQuery || "" });
-        }
-      });
-
-      window.addEventListener("mouseup", () => {
-        state.drag = null;
-        state.graphDrag = null;
-      });
-
-      svg.addEventListener("wheel", (event) => {
-        event.preventDefault();
-        const delta = event.deltaY < 0 ? 1.08 : 0.92;
-        state.graph.zoom = Math.max(0.45, Math.min(2.8, state.graph.zoom * delta));
-        renderGraph({ nodes: state.graph.nodes, edges: state.graph.edges, stats: {
-          paper_nodes: $("metric-nodes").textContent,
-          paper_edges: $("metric-edges").textContent,
-          episodes: $("metric-episodes").textContent,
-          vectors: $("metric-vectors").textContent,
-        }, query: state.graph.lastQuery || "" });
-      }, { passive: false });
-    }
-
-    async function boot() {
-      wireGraphInteractions();
-      $("btn-search").addEventListener("click", runSearch);
-      $("btn-analyze").addEventListener("click", runAnalyze);
-      $("btn-load-notes").addEventListener("click", () => loadNotes($("notes-query").value.trim()).catch((err) => setStatus("action-status", err.message, "bad")));
-      $("btn-filter-notes").addEventListener("click", () => loadNotes($("notes-query").value.trim()).catch((err) => setStatus("action-status", err.message, "bad")));
-      $("btn-query-graph").addEventListener("click", () => queryGraph().catch((err) => setStatus("action-status", err.message, "bad")));
-      $("btn-load-graph").addEventListener("click", () => queryGraph().catch((err) => setStatus("action-status", err.message, "bad")));
-      $("btn-zoom-in").addEventListener("click", () => {
-        state.graph.zoom = Math.min(2.8, state.graph.zoom * 1.12);
-        renderGraph({ nodes: state.graph.nodes, edges: state.graph.edges, stats: {
-          paper_nodes: $("metric-nodes").textContent,
-          paper_edges: $("metric-edges").textContent,
-          episodes: $("metric-episodes").textContent,
-          vectors: $("metric-vectors").textContent,
-        }, query: state.graph.lastQuery || "" });
-      });
-      $("btn-zoom-out").addEventListener("click", () => {
-        state.graph.zoom = Math.max(0.45, state.graph.zoom * 0.9);
-        renderGraph({ nodes: state.graph.nodes, edges: state.graph.edges, stats: {
-          paper_nodes: $("metric-nodes").textContent,
-          paper_edges: $("metric-edges").textContent,
-          episodes: $("metric-episodes").textContent,
-          vectors: $("metric-vectors").textContent,
-        }, query: state.graph.lastQuery || "" });
-      });
-      $("btn-reset-graph").addEventListener("click", () => {
-        state.graph.zoom = 1;
-        state.graph.panX = 0;
-        state.graph.panY = 0;
-        state.graph.positions = computeGraphLayout(state.graph.nodes, 920, 620);
-        renderGraph({ nodes: state.graph.nodes, edges: state.graph.edges, stats: {
-          paper_nodes: $("metric-nodes").textContent,
-          paper_edges: $("metric-edges").textContent,
-          episodes: $("metric-episodes").textContent,
-          vectors: $("metric-vectors").textContent,
-        }, query: state.graph.lastQuery || "" });
-      });
-
-      await refreshStats();
-      await loadNotes("");
-      await queryGraph();
-    }
-
-    boot().catch((err) => {
-      setStatus("action-status", String(err.message || err), "bad");
-    });
-  </script>
-</body>
-</html>
-""".strip()

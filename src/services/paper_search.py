@@ -107,13 +107,19 @@ class PaperDiscoveryService:
     聚合 arXiv / Semantic Scholar / GitHub 代码线索的论文发现服务。
     """
 
+    MIN_CODE_CONFIDENCE = 0.6
+
     def __init__(self, arxiv_max_results: int = 10):
         self.arxiv = ArxivSearcher(max_results=arxiv_max_results)
         self.s2 = SemanticScholarSearcher()
         self.github = GitHubCodeSearcher()
 
     def search_topic(self, query: str, max_results: int = 10) -> List[PaperItem]:
-        papers = self.arxiv.search(query, max_results=max_results)
+        try:
+            papers = self.arxiv.search(query, max_results=max_results)
+        except RuntimeError as exc:
+            print(f"[PaperDiscoveryService] arXiv unavailable, falling back to S2: {exc}")
+            papers = []
         if len(papers) < max_results:
             papers.extend(self.s2.search(query, max_results=max_results - len(papers)))
         return self._dedupe_and_rank(query, papers)
@@ -122,19 +128,25 @@ class PaperDiscoveryService:
         enriched: List[PaperItem] = []
         for paper in papers:
             code_urls = self._collect_code_urls(paper)
+            code_confidence = 1.0 if code_urls else 0.0
             if not code_urls:
                 code_hits = self.github.search_repo_for_paper(
                     paper.title,
                     keywords=paper.categories[:3],
                     max_results=max_code_hits,
                 )
-                code_urls = [hit.url for hit in code_hits]
+                qualified_hits = [
+                    hit for hit in code_hits
+                    if hit.confidence >= self.MIN_CODE_CONFIDENCE
+                ]
+                code_urls = [hit.url for hit in qualified_hits]
+                code_confidence = max((hit.confidence for hit in qualified_hits), default=0.0)
 
             paper.code_urls = code_urls
             paper.code_url = code_urls[0] if code_urls else ""
             paper.code_repos = code_urls
             paper.has_code = bool(code_urls)
-            paper.code_confidence = self._code_confidence(paper)
+            paper.code_confidence = code_confidence
             enriched.append(paper)
 
         return sorted(
@@ -193,9 +205,3 @@ class PaperDiscoveryService:
             if token in text:
                 score += 1.0
         return score + (0.25 if paper.has_code else 0.0)
-
-    @staticmethod
-    def _code_confidence(paper: PaperItem) -> float:
-        if paper.code_urls:
-            return min(1.0, 0.65 + 0.1 * len(paper.code_urls))
-        return 0.0

@@ -13,10 +13,29 @@ import re
 from dataclasses import dataclass
 from typing import List, Optional
 
-import requests
-
-
 GITHUB_REPO_RE = re.compile(r"https?://github\.com/[^/\s]+/[^/\s#?]+", re.IGNORECASE)
+NON_REPO_OWNERS = {
+    "about",
+    "apps",
+    "blog",
+    "collections",
+    "customer-stories",
+    "enterprise",
+    "events",
+    "explore",
+    "features",
+    "marketplace",
+    "new",
+    "organizations",
+    "orgs",
+    "pricing",
+    "search",
+    "settings",
+    "showcases",
+    "sponsors",
+    "topics",
+    "trending",
+}
 
 
 @dataclass
@@ -87,10 +106,25 @@ class GitHubCodeSearcher:
         seen = set()
         for url in urls:
             url = url.rstrip(".,)\"'").rstrip("/")
-            if url not in seen and "/blob/" not in url and "/tree/" not in url:
-                seen.add(url)
-                cleaned.append(url)
+            if url in seen or "/blob/" in url or "/tree/" in url:
+                continue
+            if not GitHubCodeSearcher._looks_like_repo_url(url):
+                continue
+            seen.add(url)
+            cleaned.append(url)
         return cleaned
+
+    @staticmethod
+    def _looks_like_repo_url(url: str) -> bool:
+        match = re.match(r"https?://github\.com/([^/\s]+)/([^/\s#?]+)$", url, re.IGNORECASE)
+        if not match:
+            return False
+        owner, repo = match.group(1).lower(), match.group(2).lower()
+        if owner in NON_REPO_OWNERS:
+            return False
+        if repo in {"", "repositories", "stars", "followers", "following"}:
+            return False
+        return True
 
     @staticmethod
     def _score_repo(query: str, repo: str, title: str, snippet: str) -> float:

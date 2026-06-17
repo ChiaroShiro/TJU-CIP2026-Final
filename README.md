@@ -22,7 +22,7 @@
 进入项目目录：
 
 ```powershell
-cd C:\Users\16042\Desktop\deep_research_agent-master
+cd TJU-CIP2026-Final
 ```
 
 创建虚拟环境：
