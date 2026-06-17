@@ -1,11 +1,20 @@
 #!/usr/bin/env python3
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
+import os
 import sys
 import time
 
 import typer
 from dotenv import load_dotenv
+from openai import (
+    APIConnectionError,
+    APIStatusError,
+    APITimeoutError,
+    AuthenticationError,
+    RateLimitError,
+)
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Prompt
@@ -22,7 +31,7 @@ from src.services.survey_builder import SurveyBuilder
 
 load_dotenv()
 
-app = typer.Typer()
+app = typer.Typer(pretty_exceptions_enable=False)
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 if hasattr(sys.stderr, "reconfigure"):
@@ -556,5 +565,67 @@ def _dispatch(orch, agent, action) -> str:
     return action.reply or "我暂时还不确定该怎么帮你，你可以再具体一点。"
 
 
+def _gateway_host() -> str:
+    """从 LLM_BASE_URL 提取网关域名，供错误提示使用。"""
+    base = os.getenv("LLM_BASE_URL", "").strip()
+    if not base:
+        return ""
+    try:
+        return urlparse(base).hostname or ""
+    except Exception:
+        return ""
+
+
+def _handle_known_error(exc: Exception) -> bool:
+    """把常见异常翻译成一句人话 + 排查建议。返回 True 表示已处理。"""
+    host = _gateway_host()
+
+    if isinstance(exc, (APITimeoutError, APIConnectionError)):
+        console.print(
+            "[red]✗ 调用 LLM 失败：连接超时 / 无法连接"
+            "（请求没到服务器，通常不是 API key 的问题）[/red]"
+        )
+        console.print("[yellow]  多半是代理/VPN 干扰或网络不稳定，可以试：[/yellow]")
+        if host:
+            console.print(
+                f"[yellow]  • 查代理：echo $env:HTTPS_PROXY"
+                f"（有值就在 .env 加 NO_PROXY={host} 让它直连）[/yellow]"
+            )
+            console.print(
+                f"[yellow]  • 测连通：Test-NetConnection {host} -Port 443[/yellow]"
+            )
+        else:
+            console.print(
+                "[yellow]  • 检查 HTTP_PROXY / HTTPS_PROXY 环境变量与网络连接[/yellow]"
+            )
+        return True
+
+    if isinstance(exc, AuthenticationError):
+        console.print(
+            "[red]✗ 鉴权失败：API key 无效或已过期，请检查 .env 里的 LLM_API_KEY。[/red]"
+        )
+        return True
+
+    if isinstance(exc, RateLimitError):
+        console.print(
+            "[red]✗ 触发限流或额度不足，请稍后重试，或检查网关账户额度。[/red]"
+        )
+        return True
+
+    if isinstance(exc, APIStatusError):
+        console.print(f"[red]✗ LLM 网关返回错误状态码 {exc.status_code}。[/red]")
+        return True
+
+    return False
+
+
 if __name__ == "__main__":
-    app()
+    try:
+        app()
+    except Exception as exc:  # SystemExit / KeyboardInterrupt 属于 BaseException，仍正常冒泡
+        if os.getenv("DEBUG"):
+            raise
+        if not _handle_known_error(exc):
+            console.print(f"[red]✗ 出错：{type(exc).__name__}: {exc}[/red]")
+        console.print("[dim]需要完整堆栈时，设置环境变量 DEBUG=1 后重试。[/dim]")
+        sys.exit(1)
