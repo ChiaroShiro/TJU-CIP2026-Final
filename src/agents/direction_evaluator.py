@@ -19,6 +19,7 @@ class DirectionEvaluator:
         self,
         direction: str,
         queries: Optional[List[str]] = None,
+        on_event=None,
     ) -> Dict:
         """
         评估研究方向。
@@ -27,23 +28,32 @@ class DirectionEvaluator:
             direction: 用户的原始研究方向描述（任意语言）
             queries:   可选，预先提炼好的英文检索关键词（由上游路由Agent提供）。
                        若为空，本方法会自己提炼。
+            on_event:  可选进度回调（phase/log 事件）。
         """
+        emit = on_event if on_event is not None else (lambda e: None)
+
         # 1. 获取检索关键词
         if queries is None or not queries:
+            emit({"type": "phase", "label": "提炼英文检索词", "pct": 10})
             queries = self._extract_queries(direction)
+        emit({"type": "log", "level": "info", "text": "检索词：" + " / ".join(queries)})
 
         # 2. 用每个查询分别搜索，合并去重
         all_papers: List[PaperItem] = []
         seen_titles = set()
-        for q in queries:
+        for qi, q in enumerate(queries):
+            emit({"type": "phase", "label": f"检索论文：{q}",
+                  "pct": 20 + int(50 * (qi + 1) / max(1, len(queries)))})
             papers_arxiv = self.arxiv.search(q, max_results=5)
             papers_s2 = self.s2.search(q, max_results=3)
             for p in papers_arxiv + papers_s2:
                 if p.title and p.title not in seen_titles:
                     seen_titles.add(p.title)
                     all_papers.append(p)
+        emit({"type": "log", "level": "info", "text": f"共检索到 {len(all_papers)} 篇相关论文"})
 
         # 3. 调 LLM 评估
+        emit({"type": "phase", "label": "LLM 多维评分中", "pct": 80})
         papers_summary = self._format_papers(all_papers[:12])
         prompt = self._build_evaluation_prompt(direction, queries, papers_summary)
         response = self.llm.invoke([{"role": "user", "content": prompt}], temperature=0.3)

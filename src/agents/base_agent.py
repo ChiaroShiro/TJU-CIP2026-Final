@@ -23,7 +23,7 @@ import json
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from ..core.llm import LLMClient
 from ..tools.tool import Tool, ToolRegistry, ToolResult
@@ -99,12 +99,20 @@ class BaseAgent(ABC):
     # 核心 loop
     # ------------------------------------------------------------------ #
 
-    def run(self, task: str) -> AgentRunResult:
+    def run(self, task: str, on_event: Optional[Callable[[Dict[str, Any]], None]] = None) -> AgentRunResult:
         """
         执行 autonomous loop，直到 finish 或达到上限。
 
         task: 用户给 agent 的初始任务描述。
+        on_event: 可选回调。传入时进入流式模式，逐步推送轨迹与 LLM 增量事件：
+            {"type": "step", ...}        单步轨迹（工具/参数/状态/tokens/耗时/思考）
+            {"type": "llm_delta", ...}   LLM 流式增量（content/reasoning/tool_name/tool_args）
+            {"type": "budget_warning", ...}
+          不传时走原非流式路径，行为与改动前完全一致。
         """
+        emit = on_event if on_event is not None else (lambda e: None)
+        streaming = on_event is not None
+
         messages: List[Dict[str, Any]] = [
             {"role": "system", "content": self.system_prompt()},
             {"role": "user", "content": self.initial_user_message(task)},
@@ -141,13 +149,18 @@ class BaseAgent(ABC):
                             "Call finish with your report, or delegate_to_critic if you have a draft."
                         ),
                     })
+                    emit({
+                        "type": "budget_warning",
+                        "budget_pct": round(budget_pct, 3),
+                        "step_pct": round(step_pct, 3),
+                    })
 
             step_start = time.time()
             step = AgentStep(step_idx=step_idx)
 
             # 1. LLM 决定下一步
             try:
-                completion = self._call_llm(messages)
+                completion = self._call_llm(messages, on_event if streaming else None)
             except Exception as e:
                 step.tool_result = ToolResult(
                     success=False,
@@ -188,6 +201,7 @@ class BaseAgent(ABC):
                 step.elapsed_ms = int((time.time() - step_start) * 1000)
                 steps.append(step)
                 self.on_step(step)
+                emit(self._step_event(step))
                 continue
 
             # 3. 执行工具调用（只取第一个，multi-tool 先不支持）
@@ -225,6 +239,7 @@ class BaseAgent(ABC):
                 step.elapsed_ms = int((time.time() - step_start) * 1000)
                 steps.append(step)
                 self.on_step(step)
+                emit(self._step_event(step))
                 return AgentRunResult(
                     final_output=fn_args,
                     finished=True,
@@ -247,6 +262,7 @@ class BaseAgent(ABC):
             step.elapsed_ms = int((time.time() - step_start) * 1000)
             steps.append(step)
             self.on_step(step)
+            emit(self._step_event(step))
 
         # 超出最大步数
         return AgentRunResult(
@@ -274,17 +290,66 @@ class BaseAgent(ABC):
     # 内部工具
     # ------------------------------------------------------------------ #
 
-    def _call_llm(self, messages: List[Dict[str, Any]]):
+    def _call_llm(self, messages: List[Dict[str, Any]], on_event: Optional[Callable[[Dict[str, Any]], None]] = None):
         """
         通过 LLMClient 的 function calling 接口调用 LLM。
-        返回原始 ChatCompletion，便于 agent loop 访问 tool_calls / usage。
+        返回 ChatCompletion（或同形的合成对象），便于 agent loop 访问 tool_calls / usage。
+
+        on_event 不为空时走流式，把 LLM 增量（含 finish 报告的逐字 token）实时转发出去。
         """
-        return self.llm.invoke_with_tools(
+        schemas = self.tools.openai_schemas()
+        if on_event is None:
+            return self.llm.invoke_with_tools(
+                messages=messages,
+                tools=schemas,
+                temperature=self.temperature,
+                tool_choice="auto",
+            )
+
+        def _on_delta(d: Dict[str, Any]) -> None:
+            event = {"type": "llm_delta"}
+            event.update(d)
+            on_event(event)
+
+        return self.llm.invoke_with_tools_stream(
             messages=messages,
-            tools=self.tools.openai_schemas(),
+            tools=schemas,
             temperature=self.temperature,
             tool_choice="auto",
+            on_delta=_on_delta,
         )
+
+    @staticmethod
+    def _brief_args(args: Dict[str, Any]) -> str:
+        """把工具参数压成一行简短摘要，便于前端轨迹展示。"""
+        if not args:
+            return ""
+        parts: List[str] = []
+        for key, value in args.items():
+            text = str(value).replace("\n", " ")
+            if len(text) > 60:
+                text = text[:57] + "…"
+            parts.append(f"{key}={text}")
+        return ", ".join(parts)[:200]
+
+    def _step_event(self, step: "AgentStep") -> Dict[str, Any]:
+        """把一步执行记录转成可推送的 step 事件。"""
+        res = step.tool_result
+        if step.tool_name:
+            status = "ok" if (res and res.success) else "err"
+        else:
+            status = "think"
+        return {
+            "type": "step",
+            "idx": step.step_idx,
+            "tool": step.tool_name,
+            "args_brief": self._brief_args(step.tool_args),
+            "status": status,
+            "tokens": step.tokens_used,
+            "ms": step.elapsed_ms,
+            "thought": (step.thought or "")[:400],
+            "error": (res.error if (res and not res.success and res.error) else ""),
+        }
 
     def _ensure_finish_tool(self):
         """确保注册表中有 finish 工具。子类忘加时兜底。"""

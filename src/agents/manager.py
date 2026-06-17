@@ -125,12 +125,14 @@ class ResearchManager(BaseAgent):
         settings: Settings,
         max_steps: int = 30,
         max_total_tokens: int = 200_000,
+        memory: MemoryManager = None,
+        reflection: ReflectionEngine = None,
     ):
         self.settings = settings
 
-        # 构造业务对象（生命周期由 Manager 管理）
-        self.memory = MemoryManager(settings)
-        self.reflection = ReflectionEngine(LLMClient(settings), self.memory)
+        # 构造业务对象（可注入以复用已有 memory/reflection，避免重复打开向量库）
+        self.memory = memory if memory is not None else MemoryManager(settings)
+        self.reflection = reflection if reflection is not None else ReflectionEngine(LLMClient(settings), self.memory)
         self.arxiv = ArxivSearcher(max_results=settings.search_top_k)
         self.s2 = SemanticScholarSearcher()
         self.github = GitHubCodeSearcher()
@@ -168,9 +170,12 @@ class ResearchManager(BaseAgent):
         return registry
 
     def on_step(self, step: AgentStep) -> None:
-        """每步打印进度（可选，方便调试）。"""
-        status = "✓" if (step.tool_result and step.tool_result.success) else "✗"
-        if step.tool_name:
-            print(f"  [{step.step_idx+1}] {status} {step.tool_name}  ({step.tokens_used} tokens, {step.elapsed_ms}ms)")
-        elif step.thought:
-            print(f"  [{step.step_idx+1}] 💭 {step.thought[:80]}")
+        """每步打印进度（可选，方便调试）。纯日志，必须永不抛错。"""
+        try:
+            status = "OK " if (step.tool_result and step.tool_result.success) else "ERR"
+            if step.tool_name:
+                print(f"  [{step.step_idx+1}] {status} {step.tool_name}  ({step.tokens_used} tokens, {step.elapsed_ms}ms)")
+            elif step.thought:
+                print(f"  [{step.step_idx+1}] .. {step.thought[:80]}")
+        except Exception:
+            pass

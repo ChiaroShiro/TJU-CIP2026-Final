@@ -133,7 +133,7 @@ class ConversationalAgent:
 
 只返回 JSON，不要输出其他文字。"""
 
-    def summarize_result(self, action: AgentAction, tool_output: Dict[str, Any]) -> str:
+    def _summarize_messages(self, action: AgentAction, tool_output: Dict[str, Any]) -> List[Dict[str, str]]:
         messages = [
             {
                 "role": "system",
@@ -155,4 +155,11 @@ class ConversationalAgent:
                 ),
             }
         )
-        return self.llm.invoke(messages, temperature=0.4).strip()
+        return messages
+
+    def summarize_result(self, action: AgentAction, tool_output: Dict[str, Any]) -> str:
+        return self.llm.invoke(self._summarize_messages(action, tool_output), temperature=0.4).strip()
+
+    def summarize_result_stream(self, action: AgentAction, tool_output: Dict[str, Any]):
+        """流式生成回复，逐块 yield 文本增量，供 chat 打字机使用。"""
+        yield from self.llm.invoke_stream(self._summarize_messages(action, tool_output), temperature=0.4)

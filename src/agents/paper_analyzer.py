@@ -64,9 +64,12 @@ class PaperAnalyzer:
         paper: PaperItem,
         focus: Optional[str] = None,
         use_fulltext: bool = True,
+        on_event=None,
     ) -> Dict:
         """Conservative arXiv reading mode for research and survey use."""
+        emit = on_event if on_event is not None else (lambda e: None)
         if use_fulltext:
+            emit({"type": "phase", "label": "下载并解析 PDF 全文", "pct": 8})
             fulltext = self.fetcher.fetch_fulltext(paper.paper_id)
             if fulltext and fulltext.num_chars > 500:
                 result = self._analyze_fulltext(
@@ -77,14 +80,18 @@ class PaperAnalyzer:
                     output_language="zh",
                     include_cited_similar_work=False,
                     include_memory_context=False,
+                    on_event=on_event,
                 )
+                emit({"type": "phase", "label": "抓取关键图表", "pct": 88})
                 figures = self._fetch_figures(paper)
                 result["_num_figures"] = len(figures)
                 result["_analysis_mode"] = "conservative"
                 result["_focus"] = focus or ""
+                emit({"type": "phase", "label": "保存笔记与记忆", "pct": 96})
                 self._save_note_and_memory(paper, result, figures)
                 return result
 
+        emit({"type": "log", "level": "warn", "text": "全文不可用，降级为基于摘要的保守分析"})
         result = self._analyze_abstract(paper, focus, output_language="zh")
         result["_analysis_mode"] = "conservative"
         result["_focus"] = focus or ""
@@ -96,9 +103,12 @@ class PaperAnalyzer:
         paper: PaperItem,
         focus: Optional[str] = None,
         use_fulltext: bool = True,
+        on_event=None,
     ) -> Dict:
         """Detailed reading mode for arXiv papers, with optional figure interpretation."""
+        emit = on_event if on_event is not None else (lambda e: None)
         if use_fulltext:
+            emit({"type": "phase", "label": "下载并解析 PDF 全文", "pct": 8})
             fulltext = self.fetcher.fetch_fulltext(paper.paper_id)
             if fulltext and fulltext.num_chars > 500:
                 result = self._analyze_fulltext(
@@ -109,21 +119,26 @@ class PaperAnalyzer:
                     output_language="zh",
                     include_cited_similar_work=True,
                     include_memory_context=True,
+                    on_event=on_event,
                 )
+                emit({"type": "phase", "label": "抓取关键图表", "pct": 82})
                 figures = self._fetch_figures(paper)
                 result["_num_figures"] = len(figures)
                 result["_analysis_mode"] = "multimodal"
                 result["_focus"] = focus or ""
                 if figures:
+                    emit({"type": "phase", "label": f"多模态解读 {len(figures)} 张图", "pct": 90})
                     result["figures_interpretation"] = self._describe_figures_with_vision(
                         paper=paper,
                         analysis=result,
                         figures=figures,
                         focus=focus,
                     )
+                emit({"type": "phase", "label": "保存笔记与记忆", "pct": 96})
                 self._save_note_and_memory(paper, result, figures)
                 return result
 
+        emit({"type": "log", "level": "warn", "text": "全文不可用，降级为基于摘要的分析"})
         result = self._analyze_abstract(paper, focus, output_language="zh")
         result["_analysis_mode"] = "multimodal"
         result["_focus"] = focus or ""
@@ -135,9 +150,12 @@ class PaperAnalyzer:
         pdf_path: Union[str, Path],
         title: Optional[str] = None,
         focus: Optional[str] = None,
+        on_event=None,
     ) -> Dict:
         """Conservative local PDF reading mode."""
+        emit = on_event if on_event is not None else (lambda e: None)
         path = Path(pdf_path).expanduser().resolve()
+        emit({"type": "phase", "label": "解析本地 PDF", "pct": 8})
         inferred_title = (title or "").strip() or self.fetcher.infer_title_from_pdf(path)
         paper = PaperItem(
             paper_id=path.stem,
@@ -158,10 +176,12 @@ class PaperAnalyzer:
                 output_language="zh",
                 include_cited_similar_work=True,
                 include_memory_context=True,
+                on_event=on_event,
             )
             result["_source"] = "local_pdf"
             result["_analysis_mode"] = "conservative"
             result["_focus"] = focus or ""
+            emit({"type": "phase", "label": "保存笔记与记忆", "pct": 96})
             self._save_note_and_memory(paper, result, figures=[])
             return result
 
@@ -216,13 +236,22 @@ class PaperAnalyzer:
         output_language: str,
         include_cited_similar_work: bool,
         include_memory_context: bool,
+        on_event=None,
     ) -> Dict:
+        emit = on_event if on_event is not None else (lambda e: None)
         chunks = self._build_chunks(fulltext)
+        total_chunks = len(chunks)
+        emit({"type": "log", "level": "info",
+              "text": f"全文 {fulltext.num_pages} 页，切分为 {total_chunks} 个章节块"})
         chunk_summaries: List[Dict] = []
-        for chunk_name, chunk_text in chunks:
+        for ci, (chunk_name, chunk_text) in enumerate(chunks):
+            emit({"type": "phase",
+                  "label": f"逐章分析 ({ci + 1}/{total_chunks})：{chunk_name}",
+                  "pct": 12 + int(58 * (ci + 1) / max(1, total_chunks))})
             summary = self._analyze_chunk(paper, chunk_name, chunk_text, focus, output_language)
             chunk_summaries.append({"section": chunk_name, "summary": summary})
 
+        emit({"type": "phase", "label": "综合提炼结构化笔记", "pct": 74})
         memory_context = self._collect_memory_context(paper, focus) if include_memory_context else {}
         final = self._synthesize(
             paper,
@@ -240,6 +269,7 @@ class PaperAnalyzer:
 
         references_text = (fulltext.sections or {}).get("references", "").strip()
         if include_cited_similar_work and references_text:
+            emit({"type": "phase", "label": "梳理引用中的相似工作", "pct": 79})
             final["cited_similar_work"] = self._extract_cited_similar_work(
                 paper=paper,
                 analysis=final,

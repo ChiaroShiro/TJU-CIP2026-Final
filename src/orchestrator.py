@@ -53,9 +53,9 @@ class ResearchOrchestrator:
         (settings.workspace_dir / "reports").mkdir(exist_ok=True)
 
     def evaluate_direction(
-        self, direction: str, queries: Optional[List[str]] = None,
+        self, direction: str, queries: Optional[List[str]] = None, on_event=None,
     ) -> dict:
-        result = self.evaluator.evaluate_direction(direction, queries=queries)
+        result = self.evaluator.evaluate_direction(direction, queries=queries, on_event=on_event)
         self.memory.save_task_result(
             f"direction:{direction}", direction, result.get("analysis", "")
         )
@@ -88,20 +88,36 @@ class ResearchOrchestrator:
                 papers.append(p)
         return papers
 
-    def discover_papers(self, query: str, max_results: int = 10) -> List[PaperItem]:
-        papers = self.discovery.search_topic(query, max_results=max_results)
-        return self.discovery.enrich_with_code(papers, max_code_hits=3)
+    def discover_papers(self, query: str, max_results: int = 10, on_event=None) -> List[PaperItem]:
+        papers = self.discovery.search_topic(query, max_results=max_results, on_event=on_event)
+        return self.discovery.enrich_with_code(papers, max_code_hits=3, on_event=on_event)
 
-    def run_deep_research(self, topic: str) -> ResearchResult:
+    def run_deep_research(self, topic: str, on_event=None) -> ResearchResult:
+        """编排式深度研究。
+
+        on_event 可选，传入时按阶段推送进度，并让最终报告逐字流式输出：
+            {"type": "phase",  "label": str, "pct": int}
+            {"type": "log",    "level": str, "text": str}
+            {"type": "token",  "pane": "report", "text": str}
+        """
+        emit = on_event if on_event is not None else (lambda e: None)
+
         # 查询所有记忆层，为规划提供上下文
+        emit({"type": "phase", "label": "回忆历史记忆", "pct": 5})
         memory_context = self.memory.format_context_for_prompt(topic)
 
+        emit({"type": "phase", "label": "规划研究任务", "pct": 12})
         plan = self._plan(topic, memory_context)
+        emit({"type": "log", "level": "info", "text": f"规划出 {len(plan)} 个子任务"})
         task_results, all_papers = [], []
 
-        for task in plan:
+        for task_idx, task in enumerate(plan):
+            base_pct = 15 + int(45 * task_idx / max(1, len(plan)))
+            emit({"type": "phase", "label": f"检索：{task.title}", "pct": base_pct})
             papers = self.search_papers(task.search_query)
             all_papers.extend(papers)
+            emit({"type": "log", "level": "info",
+                  "text": f"《{task.title}》检索到 {len(papers)} 篇"})
             sources = [
                 SourceItem(title=p.title, url=p.url, snippet=p.abstract[:300], rank=i)
                 for i, p in enumerate(papers[:self.settings.search_top_k])
@@ -110,6 +126,7 @@ class ResearchOrchestrator:
             rag_hits = self.memory.vector.retrieve(task.goal, self.settings.memory_top_k)
             rag_context = "\n".join(h.content for h in rag_hits)
 
+            emit({"type": "phase", "label": f"总结：{task.title}", "pct": base_pct + 4})
             result = self._summarize(topic, task, sources, rag_context)
             task_results.append(result)
             self.memory.save_task_result(
@@ -120,15 +137,21 @@ class ResearchOrchestrator:
                 task.title, result.summary_markdown, {}
             )
 
-        report_md = self._write_report(topic, task_results)
+        emit({"type": "phase", "label": "撰写综述报告", "pct": 65})
+        report_md = self._write_report(topic, task_results, on_event=on_event)
 
         # 评审-修改循环：独立 Critic Agent 评审，低于阈值则 Reviser Agent 修改
         critic_reviews = []
         for round_i in range(self.settings.max_revision_rounds):
+            emit({"type": "phase", "label": f"独立评审（第 {round_i + 1} 轮）", "pct": 80})
             review = self.critic.review(topic, report_md)
             critic_reviews.append(review)
+            emit({"type": "log", "level": "info",
+                  "text": f"Critic 评分 {review.score:.2f}"
+                          + ("（需修改）" if review.needs_revision else "（通过）")})
             if not review.needs_revision:
                 break
+            emit({"type": "phase", "label": "根据评审修改报告", "pct": 88})
             report_md = self.reviser.revise(topic, report_md, review)
 
         report_file = self._save_report(topic, report_md)
@@ -142,6 +165,7 @@ class ResearchOrchestrator:
         )
 
         # 自我学习：反思本次研究，提炼洞见和技能存入记忆
+        emit({"type": "phase", "label": "反思并沉淀记忆", "pct": 95})
         reflection_data = self.reflection_engine.reflect(research_result)
         research_result.reflection = ReflectionResult(
             episode_id=reflection_data["episode_id"],
@@ -189,11 +213,18 @@ class ResearchOrchestrator:
             sources_used=sources,
         )
 
-    def _write_report(self, topic: str, task_results: List[TaskRunResult]) -> str:
+    def _write_report(self, topic: str, task_results: List[TaskRunResult], on_event=None) -> str:
         prompt = reporter_prompt(topic, task_results)
-        return self.llm.invoke(
-            [{"role": "user", "content": prompt}], self.settings.writer_temperature
-        )
+        messages = [{"role": "user", "content": prompt}]
+        if on_event is None:
+            return self.llm.invoke(messages, self.settings.writer_temperature)
+
+        # 流式：逐字把报告推给前端打字机区，同时累计完整文本返回
+        parts: List[str] = []
+        for delta in self.llm.invoke_stream(messages, self.settings.writer_temperature):
+            parts.append(delta)
+            on_event({"type": "token", "pane": "report", "text": delta})
+        return "".join(parts)
 
     def _save_report(self, topic: str, content: str) -> str:
         ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")

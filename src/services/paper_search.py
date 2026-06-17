@@ -114,19 +114,28 @@ class PaperDiscoveryService:
         self.s2 = SemanticScholarSearcher()
         self.github = GitHubCodeSearcher()
 
-    def search_topic(self, query: str, max_results: int = 10) -> List[PaperItem]:
+    def search_topic(self, query: str, max_results: int = 10, on_event=None) -> List[PaperItem]:
+        emit = on_event if on_event is not None else (lambda e: None)
+        emit({"type": "phase", "label": "检索 arXiv", "pct": 15})
         try:
             papers = self.arxiv.search(query, max_results=max_results)
         except RuntimeError as exc:
             print(f"[PaperDiscoveryService] arXiv unavailable, falling back to S2: {exc}")
+            emit({"type": "log", "level": "warn", "text": "arXiv 被限流，改用 Semantic Scholar"})
             papers = []
         if len(papers) < max_results:
+            emit({"type": "phase", "label": "补充检索 Semantic Scholar", "pct": 30})
             papers.extend(self.s2.search(query, max_results=max_results - len(papers)))
+        emit({"type": "log", "level": "info", "text": f"去重前检索到 {len(papers)} 篇"})
         return self._dedupe_and_rank(query, papers)
 
-    def enrich_with_code(self, papers: List[PaperItem], max_code_hits: int = 3) -> List[PaperItem]:
+    def enrich_with_code(self, papers: List[PaperItem], max_code_hits: int = 3, on_event=None) -> List[PaperItem]:
+        emit = on_event if on_event is not None else (lambda e: None)
         enriched: List[PaperItem] = []
-        for paper in papers:
+        total = len(papers)
+        for idx, paper in enumerate(papers):
+            emit({"type": "phase", "label": f"关联 GitHub 代码 ({idx + 1}/{total})",
+                  "pct": 40 + int(55 * (idx + 1) / max(1, total))})
             code_urls = self._collect_code_urls(paper)
             code_confidence = 1.0 if code_urls else 0.0
             if not code_urls:
@@ -148,6 +157,12 @@ class PaperDiscoveryService:
             paper.has_code = bool(code_urls)
             paper.code_confidence = code_confidence
             enriched.append(paper)
+            if code_urls:
+                emit({"type": "log", "level": "good",
+                      "text": f"✓《{paper.title[:48]}》找到代码 (置信度 {code_confidence:.2f})"})
+            else:
+                emit({"type": "log", "level": "muted",
+                      "text": f"✗《{paper.title[:48]}》未发现公开代码"})
 
         return sorted(
             enriched,
