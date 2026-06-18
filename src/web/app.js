@@ -7,8 +7,10 @@
 
 const $ = (id) => document.getElementById(id);
 const EDGE_COLORS = { builds_on: "#38bdf8", compares_with: "#fb7185", similar_to: "#94a3b8" };
-const NODE_COLOR = "#2dd4bf";
-const NODE_PLACEHOLDER = "#f59e0b";
+const NODE_COLOR = "#2dd4bf";          // read 精读
+const NODE_DISCOVERED = "#818cf8";     // discovered 检索发现（综述/研究）
+const NODE_PLACEHOLDER = "#f59e0b";    // cited 引用占位
+const GRAPH_LAYERS = ["read", "discovered", "cited"];
 
 /* ------------------------------ 基础工具 ------------------------------ */
 function escapeHtml(text) {
@@ -552,6 +554,25 @@ async function runSurvey() {
 
 /* ------------------------------ 深度研究 ------------------------------ */
 const research = { raw: "", timer: null, steps: 0, tokens: 0, maxSteps: 30, maxTokens: 200000, mode: "auto" };
+// 自主研究：工具名 → 人类可读的当前活动（用于状态行，避免假百分比卡住）
+const TOOL_ACTIVITY = {
+  retrieve_memory: "回忆历史记忆",
+  search_arxiv: "检索 arXiv 论文",
+  search_semantic_scholar: "检索 Semantic Scholar",
+  search_github_code: "关联 GitHub 代码",
+  fetch_paper_fulltext: "获取论文全文",
+  analyze_paper: "精读论文",
+  save_note: "记录中间发现",
+  delegate_to_critic: "提交独立评审",
+  delegate_to_reviser: "修订报告",
+  save_research_episode: "归档与反思",
+  web_search: "网络检索",
+  web_fetch: "抓取网页",
+  finish: "撰写最终报告",
+};
+function stepActivity(ev) {
+  return TOOL_ACTIVITY[ev.tool] || (ev.tool || "思考中");
+}
 function stepCard(ev) {
   const cls = ev.status === "ok" ? "ok" : ev.status === "err" ? "err" : "think";
   const statusTxt = ev.status === "ok" ? "OK" : ev.status === "err" ? "ERR" : "···";
@@ -605,6 +626,7 @@ async function runResearch() {
   $("r-trace-count").textContent = "进行中…";
   $("r-report").innerHTML = `<div class="empty"><div class="ic">⏳</div><div>研究启动中…</div></div>`;
   $("r-stats").hidden = true;
+  $("r-figures").innerHTML = "";
   $("r-budget").hidden = research.mode !== "auto";
   if (research.mode === "auto") {
     const bf = $("r-budget-fill");
@@ -624,8 +646,12 @@ async function runResearch() {
         trace.appendChild(stepCard(ev)); trace.scrollTop = trace.scrollHeight;
         $("r-trace-count").textContent = `${research.steps} 步`;
         updateBudget();
+        // 自主模式没有固定计划，无法算线性百分比 —— 用"当前活动 · 第 N 步"实时反映进展
+        if (research.mode === "auto") setStatus("r-status", stepActivity(ev) + ` · 第 ${research.steps} 步`);
       } else if (ev.type === "phase") {
-        setStatus("r-status", ev.label + (typeof ev.pct === "number" ? ` · ${Math.round(ev.pct)}%` : ""));
+        // 自主模式只显示阶段名（不显示会卡住的假百分比）；编排式有确定阶段，保留平滑百分比
+        if (research.mode === "auto") setStatus("r-status", ev.label);
+        else setStatus("r-status", ev.label + (typeof ev.pct === "number" ? ` · ${Math.round(ev.pct)}%` : ""));
       } else if (ev.type === "log") {
         trace.appendChild(traceLogLine(ev.level, ev.text)); trace.scrollTop = trace.scrollHeight;
       } else if (ev.type === "token" && ev.pane === "report") {
@@ -678,6 +704,9 @@ function finalizeResearch(p) {
   if (p.report_path) bits.push(`已保存`);
   const stats = $("r-stats"); stats.hidden = false;
   stats.innerHTML = bits.map((b) => `<span>${escapeHtml(b)}</span>`).join("");
+
+  if (p.figures && p.figures.length) renderFigures($("r-figures"), p.figures);
+  else $("r-figures").innerHTML = "";
 }
 
 /* ------------------------------ 对话 ------------------------------ */
@@ -747,9 +776,18 @@ async function clearChat() {
 }
 
 /* ------------------------------ 图谱（d3 力导向 + 降级） ------------------------------ */
-const graphState = { sim: null, zoom: null, svg: null };
+const graphState = { sim: null, zoom: null, svg: null, snapshot: null, activeLayers: new Set(GRAPH_LAYERS) };
 function edgeColor(type) { return EDGE_COLORS[type] || EDGE_COLORS.similar_to; }
-function nodeColor(n) { return n.metadata && n.metadata.placeholder ? NODE_PLACEHOLDER : NODE_COLOR; }
+function nodeLayer(n) {
+  if (n.layer) return n.layer;
+  if (n.metadata && n.metadata.placeholder) return "cited";
+  if (n.metadata && n.metadata.source === "discovered") return "discovered";
+  return "read";
+}
+function nodeColor(n) {
+  const L = nodeLayer(n);
+  return L === "cited" ? NODE_PLACEHOLDER : L === "discovered" ? NODE_DISCOVERED : NODE_COLOR;
+}
 function nodeLabel(n) { return n.method_name || n.title || n.paper_id || ""; }
 function showNodeDetail(n) {
   const el = $("g-detail"); el.className = "node-detail";
@@ -803,6 +841,8 @@ function renderGraphD3(snapshot) {
   nodeSel.append("circle").attr("class", "core").attr("r", radius).attr("fill", (d) => nodeColor(d)).attr("fill-opacity", 0.95);
   nodeSel.append("text").attr("text-anchor", "middle").attr("dy", (d) => radius(d) + 15)
     .text((d) => { const t = nodeLabel(d); return t.length > 16 ? t.slice(0, 15) + "…" : t; });
+  // 切换层次/重载时节点淡入（仅 .gnode，避开 .gedge 的 CSS 过渡）
+  nodeSel.attr("opacity", 0).transition().duration(450).attr("opacity", 1);
   const adj = {};
   links.forEach((l) => { (adj[l.source] = adj[l.source] || new Set()).add(l.target); (adj[l.target] = adj[l.target] || new Set()).add(l.source); });
   nodeSel.on("mouseenter", (ev, d) => {
@@ -831,12 +871,14 @@ function renderGraphFallback(snapshot) {
   const svgEl = $("graph-stage");
   const w = svgEl.clientWidth || 760, h = svgEl.clientHeight || 560;
   const nodes = snapshot.nodes || [];
-  setGraphStats(snapshot, nodes.length, (snapshot.edges || []).length);
-  if (!nodes.length) { svgEl.innerHTML = `<text x="${w / 2}" y="${h / 2}" text-anchor="middle" fill="#94a3b8">暂无图谱数据</text>`; return; }
+  if (!nodes.length) { setGraphStats(snapshot, 0, 0); svgEl.innerHTML = `<text x="${w / 2}" y="${h / 2}" text-anchor="middle" fill="#94a3b8">暂无图谱数据</text>`; return; }
   const pos = {}, cx = w / 2, cy = h / 2, R = Math.min(w, h) * 0.36;
   nodes.forEach((n, idx) => { const a = (idx / nodes.length) * Math.PI * 2; pos[n.paper_id] = { x: cx + R * Math.cos(a), y: cy + R * Math.sin(a) }; });
-  const edges = (snapshot.edges || []).map((e) => {
-    const a = pos[e.src_paper_id], b = pos[e.dst_paper_id]; if (!a || !b) return "";
+  // 只统计/绘制两端节点都在当前层次内的边，避免过滤后边数被高估
+  const validEdges = (snapshot.edges || []).filter((e) => pos[e.src_paper_id] && pos[e.dst_paper_id]);
+  setGraphStats(snapshot, nodes.length, validEdges.length);
+  const edges = validEdges.map((e) => {
+    const a = pos[e.src_paper_id], b = pos[e.dst_paper_id];
     return `<line x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}" stroke="${edgeColor(e.relation_type)}" stroke-width="1.6" stroke-opacity="0.6"/>`;
   }).join("");
   const circles = nodes.map((n) => {
@@ -852,8 +894,22 @@ async function loadGraph(query = "") {
   $("graph-engine").textContent = window.d3 ? "d3 force" : "fallback layout";
   try {
     const snap = await apiGet("/api/graph" + (query ? "?q=" + encodeURIComponent(query) : ""));
-    if (window.d3) renderGraphD3(snap); else renderGraphFallback(snap);
+    graphState.snapshot = snap;
+    updateLayerCounts(snap);
+    applyGraphFilter();
   } catch (err) { $("g-stats").textContent = "加载失败: " + (err.message || err); toast("图谱加载失败", "bad"); }
+}
+function updateLayerCounts(snap) {
+  const counts = { read: 0, discovered: 0, cited: 0 };
+  (snap.nodes || []).forEach((n) => { const L = nodeLayer(n); if (counts[L] != null) counts[L] += 1; });
+  GRAPH_LAYERS.forEach((L) => { const el = document.querySelector(`.lt-count[data-count="${L}"]`); if (el) el.textContent = counts[L]; });
+}
+function applyGraphFilter() {
+  const snap = graphState.snapshot;
+  if (!snap) return;
+  const active = graphState.activeLayers;
+  const filtered = Object.assign({}, snap, { nodes: (snap.nodes || []).filter((n) => active.has(nodeLayer(n))) });
+  if (window.d3) renderGraphD3(filtered); else renderGraphFallback(filtered);
 }
 function zoomBy(factor) { if (graphState.svg && graphState.zoom) graphState.svg.transition().duration(250).call(graphState.zoom.scaleBy, factor); }
 function resetGraph() { if (graphState.svg && graphState.zoom && window.d3) graphState.svg.transition().duration(300).call(graphState.zoom.transform, window.d3.zoomIdentity); }
@@ -861,6 +917,9 @@ function resetGraph() { if (graphState.svg && graphState.zoom && window.d3) grap
 /* ------------------------------ 笔记 ------------------------------ */
 function renderNotes(items) {
   const host = $("n-list");
+  const n = (items || []).length;
+  const countEl = $("n-count");
+  if (countEl) countEl.textContent = n ? `共 ${n} 篇笔记${n >= 50 ? "（仅显示前 50，可用关键词筛选）" : ""}` : "";
   if (!items || !items.length) { host.innerHTML = emptyState("📭", "没有匹配到笔记", "先精读一篇论文"); return; }
   host.innerHTML = items.map((it) => `
     <div class="list-item">
@@ -873,7 +932,10 @@ function renderNotes(items) {
 }
 async function loadNotes(query = "") {
   try { renderNotes(await apiGet("/api/notes" + (query ? "?q=" + encodeURIComponent(query) : ""))); }
-  catch (err) { $("n-list").innerHTML = emptyState("⚠️", "加载笔记失败", String(err.message || err)); }
+  catch (err) {
+    const countEl = $("n-count"); if (countEl) countEl.textContent = "";
+    $("n-list").innerHTML = emptyState("⚠️", "加载笔记失败", String(err.message || err));
+  }
 }
 async function openNote(path) {
   if (!path) throw new Error("笔记路径为空");
@@ -934,6 +996,18 @@ function wireEvents() {
   $("g-zoom-in").addEventListener("click", () => zoomBy(1.3));
   $("g-zoom-out").addEventListener("click", () => zoomBy(1 / 1.3));
   $("g-reset").addEventListener("click", resetGraph);
+  // 图谱层次开关
+  document.querySelectorAll("#g-layers .layer-pill").forEach((pill) => pill.addEventListener("click", () => {
+    const layer = pill.dataset.layer;
+    if (graphState.activeLayers.has(layer)) {
+      if (graphState.activeLayers.size <= 1) { toast("至少保留一个层次", "info"); return; }
+      graphState.activeLayers.delete(layer); pill.classList.remove("active");
+    } else {
+      graphState.activeLayers.add(layer); pill.classList.add("active");
+    }
+    pill.classList.remove("pulse"); void pill.offsetWidth; pill.classList.add("pulse");  // 重启脉冲动效
+    applyGraphFilter();
+  }));
   // 笔记
   $("n-run").addEventListener("click", () => loadNotes($("n-q").value.trim()));
   $("n-q").addEventListener("keydown", (e) => { if (e.key === "Enter") loadNotes($("n-q").value.trim()); });

@@ -213,17 +213,22 @@ def survey(
     topic: str = typer.Argument(..., help="研究主题"),
     max_papers: int = typer.Option(12, "--max-papers", "-n", help="综述纳入论文数"),
 ):
-    """生成文献综述草稿、算法演进图和 SVG 海报。无需 LLM API key。"""
+    """生成文献综述草稿、算法演进图和 SVG 海报。
+
+    无 API key 也可运行：演进图按 arXiv 主类目确定性分泳道；
+    配置 LLM key 后，演进图升级为 LLM 划分技术分支 + 继承/对比关系。
+    """
     root = Path(__file__).parent
     settings = Settings.from_env(root)
-    builder = SurveyBuilder(settings.workspace_dir)
+    # 有 key 时演进图走 LLM 版（分支 + 继承/对比），无 key 自动降级为确定性启发式
+    builder = SurveyBuilder(settings.workspace_dir, llm=LLMClient(settings))
 
     with console.status("正在生成综述、演进图和海报..."):
         artifact = builder.build(topic, max_papers=max_papers)
 
     console.print(Panel("[bold green]综述产物已生成[/bold green]", border_style="green"))
     console.print(f"报告: {artifact.report_file}")
-    console.print(f"演进图: {artifact.timeline_file}")
+    console.print(f"算法演进图: {artifact.evolution_file}")
     console.print(f"海报: {artifact.poster_file}")
     console.print(f"原始数据: {artifact.raw_data_file}")
 

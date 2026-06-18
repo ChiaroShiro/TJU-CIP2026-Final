@@ -208,6 +208,41 @@ def _paper_brief(paper) -> Dict[str, Any]:
     }
 
 
+def _figures_from_artifact(artifact) -> list:
+    """把 SurveyArtifact 的演进图 / 海报 SVG 读成前端「图产物」契约（kind=svg）。
+
+    survey 与 research 共用，保证两条链路产出同一形态、同等质量的图。
+    """
+    figures = []
+    try:
+        evo_svg = Path(artifact.evolution_file).read_text(encoding="utf-8")
+        figures.append({
+            "id": "evolution",
+            "title": "算法演进图",
+            "kind": "svg",
+            "svg": evo_svg,
+            "download_path": artifact.evolution_file,
+            "meta": {"source": "survey_evolution",
+                     "note": "多泳道演进图：纵轴为发布时间（越靠下越新），列为技术分支；实线=继承/改进，虚线=对比，绿点=有公开代码。"},
+        })
+    except Exception:
+        pass
+    try:
+        poster_svg = Path(artifact.poster_file).read_text(encoding="utf-8")
+        figures.append({
+            "id": "poster",
+            "title": "综述海报",
+            "kind": "svg",
+            "svg": poster_svg,
+            "download_path": artifact.poster_file,
+            "meta": {"source": "survey_poster",
+                     "note": "证据优先、公开代码优先的综述海报，尽力内联论文原图。"},
+        })
+    except Exception:
+        pass
+    return figures
+
+
 def build_gui_app(orchestrator: "ResearchOrchestrator") -> ThreadingHTTPServer:
     workspace_dir = orchestrator.settings.workspace_dir
     heavy_lock = threading.Lock()        # 串行化研究等重任务，保护记忆库/限流
@@ -489,35 +524,17 @@ def build_gui_app(orchestrator: "ResearchOrchestrator") -> ThreadingHTTPServer:
                 max_papers = int(payload.get("max_papers", 12) or 12)
             except (TypeError, ValueError):
                 max_papers = 12
-            max_papers = max(3, min(30, max_papers))
+            max_papers = max(3, min(60, max_papers))
 
             from .services.survey_builder import SurveyBuilder
 
-            builder = SurveyBuilder(workspace_dir)
-            artifact = builder.build(topic, max_papers=max_papers)
+            # 有 key 时演进图走 LLM 版（分支 + 继承/对比），无 key 自动降级为确定性启发式
+            # 传入 memory：把演进图的论文/关系并入论文图谱（"检索发现"层）
+            builder = SurveyBuilder(workspace_dir, llm=orchestrator.llm, memory=orchestrator.memory)
+            artifact = builder.build(topic, max_papers=max_papers, origin="survey")
 
-            timeline_svg = Path(artifact.timeline_file).read_text(encoding="utf-8")
-            poster_svg = Path(artifact.poster_file).read_text(encoding="utf-8")
             report_md = Path(artifact.report_file).read_text(encoding="utf-8")
-
-            figures = [
-                {
-                    "id": "timeline",
-                    "title": "算法发展演进图",
-                    "kind": "svg",
-                    "svg": timeline_svg,
-                    "download_path": artifact.timeline_file,
-                    "meta": {"source": "survey_timeline", "note": "按发布日期排序，绿色节点表示发现公开代码。"},
-                },
-                {
-                    "id": "poster",
-                    "title": "综述海报",
-                    "kind": "svg",
-                    "svg": poster_svg,
-                    "download_path": artifact.poster_file,
-                    "meta": {"source": "survey_poster", "note": "证据优先、公开代码优先的综述海报。"},
-                },
-            ]
+            figures = _figures_from_artifact(artifact)
             papers = [
                 {
                     "title": p.title,
@@ -657,6 +674,7 @@ def build_gui_app(orchestrator: "ResearchOrchestrator") -> ThreadingHTTPServer:
             emit({"type": "phase", "label": "启动编排式研究流水线", "pct": 2})
             result = orchestrator.run_deep_research(topic, on_event=emit)
             critic_score = result.critic_reviews[-1].score if result.critic_reviews else None
+            figures = self._topic_figures(emit, topic)
             emit({"type": "phase", "label": "完成", "pct": 100})
             emit({
                 "type": "result",
@@ -665,6 +683,7 @@ def build_gui_app(orchestrator: "ResearchOrchestrator") -> ThreadingHTTPServer:
                     "finished": True,
                     "report_md": result.final_report_markdown,
                     "report_path": result.report_file,
+                    "figures": figures,
                     "stats": {
                         "paper_count": len(result.papers),
                         "task_count": len(result.task_results),
@@ -727,6 +746,7 @@ def build_gui_app(orchestrator: "ResearchOrchestrator") -> ThreadingHTTPServer:
                 if report_buf["emitted"] == 0:
                     emit({"type": "token", "pane": "report", "text": report})
 
+            figures = self._topic_figures(emit, topic) if (result.finished and report) else []
             emit({"type": "phase", "label": "完成", "pct": 100})
             emit({
                 "type": "result",
@@ -736,6 +756,7 @@ def build_gui_app(orchestrator: "ResearchOrchestrator") -> ThreadingHTTPServer:
                     "finish_reason": result.finish_reason,
                     "report_md": report,
                     "report_path": report_path,
+                    "figures": figures,
                     "stats": {
                         "total_steps": len(result.steps),
                         "total_tokens": result.total_tokens,
@@ -753,6 +774,22 @@ def build_gui_app(orchestrator: "ResearchOrchestrator") -> ThreadingHTTPServer:
             path = reports_dir / f"{timestamp}_{safe_topic or 'research'}.md"
             path.write_text(report, encoding="utf-8")
             return str(path)
+
+        def _topic_figures(self, emit, topic: str) -> list:
+            """研究结束后，为主题生成算法演进图 + 海报（与 survey 同质同源）。
+
+            best-effort：任何失败都只记一条日志、返回空列表，绝不影响报告交付。
+            """
+            try:
+                emit({"type": "phase", "label": "生成算法演进图与海报", "pct": 97})
+                from .services.survey_builder import SurveyBuilder
+                builder = SurveyBuilder(workspace_dir, llm=orchestrator.llm, memory=orchestrator.memory)
+                artifact = builder.build(topic, max_papers=12, origin="research")
+                return _figures_from_artifact(artifact)
+            except Exception as exc:
+                emit({"type": "log", "level": "warn",
+                      "text": f"演进图/海报生成跳过：{type(exc).__name__}: {exc}"})
+                return []
 
         # -------------------- 对话 dispatch -------------------- #
         def _job_chat(self, emit, payload: Dict[str, Any]) -> None:

@@ -175,14 +175,14 @@
         <section class="view" data-view="survey">
           <div class="view-head">
             <h1><span class="vh-ic">📚</span> 综述生成</h1>
-            <p>无需 LLM 即可生成综述草稿、算法演进图与海报（纯证据排列，确定性产出）。</p>
+            <p>生成综述草稿、算法演进图与海报。无 Key 时演进图按类目确定性分泳道；配置 Key 后由 LLM 划分技术分支并标注继承/对比关系。</p>
           </div>
           <div class="card">
             <div class="field">
               <label for="sv-topic">综述主题</label>
               <div class="inline">
                 <input id="sv-topic" placeholder="例如：diffusion policy for robot manipulation" />
-                <input id="sv-n" type="number" min="3" max="30" value="10" title="纳入论文数" />
+                <input id="sv-n" type="number" min="3" max="60" value="10" title="纳入论文数" />
                 <button class="btn btn-primary" id="sv-run">生成综述</button>
               </div>
             </div>
@@ -244,6 +244,8 @@
               <div class="report-stats" id="r-stats" hidden></div>
             </div>
           </div>
+
+          <div class="figure-gallery" id="r-figures"></div>
         </section>
 
         <!-- ===================== 对话 ===================== -->
@@ -268,7 +270,7 @@
         <section class="view" data-view="graph">
           <div class="view-head">
             <h1><span class="vh-ic">🕸️</span> 论文关系图谱</h1>
-            <p>已读论文构成的知识图——节点是论文，边是引用 / 相似 / 对比关系。</p>
+            <p>论文知识图——节点是论文，边是继承 / 对比 / 相似关系。按层次着色：精读、检索发现、引用占位，可点下方层次开关筛选。</p>
           </div>
           <div class="card">
             <div class="field">
@@ -278,6 +280,18 @@
                 <button class="btn btn-primary" id="g-run">查询</button>
                 <span class="eyebrow" id="graph-engine">d3 force</span>
               </div>
+            </div>
+            <div class="layer-toggle" id="g-layers" role="group" aria-label="显示层次">
+              <span class="lt-label">显示层次</span>
+              <button type="button" class="layer-pill active" data-layer="read" style="--pill:#2dd4bf;">
+                <span class="dot"></span><span class="lt-name">精读</span><span class="lt-count" data-count="read">0</span>
+              </button>
+              <button type="button" class="layer-pill active" data-layer="discovered" style="--pill:#818cf8;">
+                <span class="dot"></span><span class="lt-name">检索发现</span><span class="lt-count" data-count="discovered">0</span>
+              </button>
+              <button type="button" class="layer-pill active" data-layer="cited" style="--pill:#f59e0b;">
+                <span class="dot"></span><span class="lt-name">引用占位</span><span class="lt-count" data-count="cited">0</span>
+              </button>
             </div>
           </div>
           <div class="graph-wrap">
@@ -293,11 +307,12 @@
               <div class="panel-box">
                 <h3>图例</h3>
                 <div class="legend">
-                  <div class="legend-item"><span class="dot" style="background:#2dd4bf;"></span> 已读论文节点</div>
+                  <div class="legend-item"><span class="dot" style="background:#2dd4bf;"></span> 精读节点（深度分析）</div>
+                  <div class="legend-item"><span class="dot" style="background:#818cf8;"></span> 检索发现节点（综述/研究）</div>
                   <div class="legend-item"><span class="dot" style="background:#f59e0b;"></span> 引用占位节点</div>
-                  <div class="legend-item"><span class="line-key" style="border-color:#38bdf8;"></span> builds_on</div>
-                  <div class="legend-item"><span class="line-key" style="border-color:#fb7185;"></span> compares_with</div>
-                  <div class="legend-item"><span class="line-key" style="border-color:#94a3b8;"></span> similar_to</div>
+                  <div class="legend-item"><span class="line-key" style="border-color:#38bdf8;"></span> builds_on 继承/改进</div>
+                  <div class="legend-item"><span class="line-key" style="border-color:#fb7185;"></span> compares_with 对比</div>
+                  <div class="legend-item"><span class="line-key" style="border-color:#94a3b8;"></span> similar_to 相似</div>
                 </div>
               </div>
               <div class="panel-box">
@@ -327,6 +342,7 @@
                     <input id="n-q" placeholder="留空显示最新笔记" />
                     <button class="btn btn-primary btn-sm" id="n-run">筛选</button>
                   </div>
+                  <div class="status" id="n-count"></div>
                 </div>
               </div>
               <div class="scroll-list" id="n-list"></div>

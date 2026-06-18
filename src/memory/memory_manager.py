@@ -559,6 +559,77 @@ class MemoryManager:
                 source_kind=source_kind,
             )
 
+    def merge_evolution_graph(self, papers, evo: Dict[str, Any], origin: str = "survey") -> Dict[str, int]:
+        """把算法演进图的节点+关系并入论文图谱（作为"检索发现"层）。
+
+        - 节点：以 `metadata.source="discovered"` 标记，作为独立层次着色；
+          绝不覆盖已精读节点（有 note_path / problem / method_summary 的）。
+        - 边：只持久化 builds_on / compares_with（语义边），用独立 source_kind="evolution"
+          以免与精读抽取的引用边冲突；方向对齐既有约定（src=较新，dst=较旧）。
+        返回 {"nodes_added", "edges_added"}。
+        """
+        if not evo or not isinstance(evo, dict):
+            return {"nodes_added": 0, "edges_added": 0}
+
+        nodes = evo.get("nodes") or []
+        edges = evo.get("edges") or []
+        by_id = {getattr(p, "paper_id", ""): p for p in (papers or []) if getattr(p, "paper_id", "")}
+
+        row_to_pid: Dict[Any, str] = {}
+        nodes_added = 0
+        for n in nodes:
+            pid = (n.get("paper_id") or "").strip()
+            if not pid:
+                continue
+            row_to_pid[n.get("id")] = pid
+
+            existing = self.paper_graph.get_paper(pid)
+            # 不覆盖已精读节点
+            if existing and (existing.note_path or existing.problem or existing.method_summary):
+                continue
+
+            paper = by_id.get(pid)
+            title = n.get("title") or (getattr(paper, "title", "") if paper else "") or pid
+            abstract = (getattr(paper, "abstract", "") if paper else "") or ""
+            tldr = " ".join(abstract.split())[:200]
+            cats = list(getattr(paper, "categories", []) or []) if paper else []
+            self.paper_graph.upsert_paper(
+                paper_id=pid,
+                title=title,
+                tldr=tldr,
+                tags=cats[:6],
+                metadata={
+                    "source": "discovered",
+                    "origin": origin,
+                    "url": getattr(paper, "url", "") if paper else "",
+                    "year": n.get("year", ""),
+                    "has_code": bool(n.get("has_code")),
+                },
+            )
+            nodes_added += 1
+
+        edges_added = 0
+        for e in edges:
+            rel = e.get("type", "")
+            if rel not in ("builds_on", "compares_with"):
+                continue  # 启发式 similar_to 不入库，避免无语义连线污染知识图
+            early_pid = row_to_pid.get(e.get("src"))   # src=较早
+            late_pid = row_to_pid.get(e.get("dst"))    # dst=较晚
+            if not early_pid or not late_pid or early_pid == late_pid:
+                continue
+            # 约定：src=较新的论文 builds_on/compares_with 较旧的 dst
+            self.paper_graph.add_edge(
+                src_paper_id=late_pid,
+                dst_paper_id=early_pid,
+                relation_type=rel,
+                relation_strength=0.6,
+                evidence=(e.get("reason", "") or "")[:500],
+                source_kind="evolution",
+            )
+            edges_added += 1
+
+        return {"nodes_added": nodes_added, "edges_added": edges_added}
+
     def save_research_episode(
         self,
         topic: str,
@@ -625,6 +696,22 @@ class MemoryManager:
         }
 
     @staticmethod
+    def _node_layer(node) -> str:
+        """判定节点所属层次：read（精读）/ discovered（检索发现）/ cited（引用占位）。
+
+        优先级 read > discovered > cited：一篇论文若已精读，即便后续又被检索到，
+        仍归为 read，不被降级。
+        """
+        md = node.metadata or {}
+        if node.note_path or node.problem or node.method_summary:
+            return "read"
+        if md.get("source") == "discovered":
+            return "discovered"
+        if md.get("placeholder"):
+            return "cited"
+        return "read"
+
+    @staticmethod
     def _serialize_paper_node(node) -> Dict[str, Any]:
         return {
             "paper_id": node.paper_id,
@@ -638,6 +725,7 @@ class MemoryManager:
             "datasets": node.datasets or [],
             "related_work": node.related_work or [],
             "metadata": node.metadata or {},
+            "layer": MemoryManager._node_layer(node),
             "created_at": node.created_at,
             "updated_at": node.updated_at,
         }

@@ -292,8 +292,13 @@ select { appearance: none; cursor: pointer;
 .list-item {
   background: var(--surface); border: 1px solid var(--border);
   border-radius: var(--radius-sm); padding: 15px 17px; transition: var(--t);
+  min-width: 0;
 }
 .list-item:hover { border-color: var(--border-strong); transform: translateY(-1px); box-shadow: var(--shadow-sm); }
+.li-title, .li-meta {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
 .li-title { font-weight: 700; font-size: 14.5px; margin-bottom: 5px; }
 .li-meta { font-size: 12.5px; color: var(--text-dim); line-height: 1.5; }
 .li-actions { display: flex; gap: 8px; margin-top: 11px; flex-wrap: wrap; }
@@ -403,6 +408,7 @@ select { appearance: none; cursor: pointer;
 
 .research-grid { display: grid; grid-template-columns: 1fr 1.15fr; gap: 18px; align-items: start; }
 .trace-card, .report-card { margin-bottom: 0; }
+.view[data-view="research"] .figure-gallery { margin-top: 22px; }
 .trace-list { display: flex; flex-direction: column; gap: 9px; max-height: 70vh; overflow-y: auto; padding-right: 4px; }
 .step-card {
   background: var(--surface-2); border: 1px solid var(--border); border-left: 3px solid var(--faint);
@@ -449,6 +455,27 @@ select { appearance: none; cursor: pointer;
 .graph-toolbar { position: absolute; top: 12px; right: 12px; display: flex; flex-direction: column; gap: 6px; z-index: 3; }
 .graph-toolbar button { width: 34px; height: 34px; border-radius: 9px; border: 1px solid var(--border); background: var(--surface); color: var(--text); cursor: pointer; font-size: 16px; transition: var(--t); }
 .graph-toolbar button:hover { border-color: var(--brand); }
+
+/* 层次切换开关（带动效） */
+.layer-toggle { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 14px; }
+.lt-label { font-size: 12px; color: var(--faint); margin-right: 2px; }
+.layer-pill {
+  display: inline-flex; align-items: center; gap: 7px;
+  padding: 6px 12px; border-radius: 999px;
+  border: 1px solid var(--border); background: var(--surface-2);
+  color: var(--text-dim); font-size: 12.5px; font-weight: 600; font-family: inherit; cursor: pointer;
+  transition: background var(--t), border-color var(--t), color var(--t), transform var(--t), box-shadow var(--t), opacity var(--t), filter var(--t);
+}
+.layer-pill .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--pill); transition: transform var(--t), box-shadow var(--t); }
+.layer-pill .lt-count { font-family: var(--mono); font-size: 11px; padding: 1px 7px; border-radius: 999px; background: color-mix(in srgb, var(--pill) 18%, transparent); color: var(--pill); }
+.layer-pill:hover { transform: translateY(-1px); border-color: var(--border-strong); }
+.layer-pill.active { color: var(--text); border-color: color-mix(in srgb, var(--pill) 55%, var(--border)); background: color-mix(in srgb, var(--pill) 14%, var(--surface-2)); box-shadow: 0 6px 18px -10px var(--pill); }
+.layer-pill.active .dot { box-shadow: 0 0 0 4px color-mix(in srgb, var(--pill) 22%, transparent); }
+.layer-pill:not(.active) { opacity: .5; filter: grayscale(.55); }
+.layer-pill:not(.active) .dot { transform: scale(.66); }
+.layer-pill.pulse { animation: pillPulse .42s cubic-bezier(.22,.61,.36,1); }
+@keyframes pillPulse { 0% { transform: scale(1); } 40% { transform: scale(1.09); } 100% { transform: scale(1); } }
+
 .graph-info { display: flex; flex-direction: column; gap: 12px; }
 .legend { display: flex; flex-direction: column; gap: 8px; }
 .legend-item { display: flex; align-items: center; gap: 9px; font-size: 12.5px; color: var(--text-dim); }
@@ -466,6 +493,8 @@ select { appearance: none; cursor: pointer;
 /* ----------------------------- 笔记 ----------------------------- */
 .notes-wrap { display: grid; grid-template-columns: 380px 1fr; gap: 18px; align-items: start; }
 .notes-col { display: flex; flex-direction: column; gap: 14px; }
+/* 左栏笔记列表独立滚动：笔记很多时在视口内滚动，不再把整页越拉越长 */
+#n-list { max-height: calc(100vh - 300px); min-height: 220px; overflow-y: auto; padding-right: 4px; }
 .note-viewer { max-height: 80vh; overflow-y: auto; }
 
 /* ----------------------------- Markdown ----------------------------- */

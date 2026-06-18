@@ -104,6 +104,6 @@ class SurveyArtifact:
     papers: List[PaperItem] = field(default_factory=list)
     report_file: str = ""
     poster_file: str = ""
-    timeline_file: str = ""
+    evolution_file: str = ""
     raw_data_file: str = ""
     created_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
