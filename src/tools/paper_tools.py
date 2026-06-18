@@ -63,11 +63,12 @@ def build_fetch_fulltext_tool(fetcher: PaperFetcher) -> Tool:
 def build_analyze_paper_tool(
     analyzer: PaperAnalyzer,
     arxiv_searcher: ArxivSearcher,
-    memory=None,
 ) -> Tool:
     """
-    需要传入 arxiv_searcher 和可选的 memory（MemoryManager）。
-    如果传了 memory，分析完后会把摘要写入 vector store（paper:{arxiv_id} 前缀）。
+    需要传入 arxiv_searcher。
+    持久化由 analyzer 负责：若 analyzer 注入了 memory，analyze() 会经
+    save_paper_note 把笔记摘要写入向量库（paper:{id}）并把节点/关系并入论文图谱。
+    工具层不再重复写入，避免对同一 paper:{id} 的重复 add。
     """
     def run(args):
         arxiv_id = (args.get("arxiv_id") or "").strip()
@@ -83,27 +84,6 @@ def build_analyze_paper_tool(
             )
 
         result = analyzer.analyze(metas[0], focus=focus, use_fulltext=True)
-
-        # 写入 vector store（paper:* namespace）
-        if memory is not None:
-            tldr = result.get("tldr", "")
-            contributions = "\n".join(f"- {c}" for c in result.get("contributions", []))
-            summary_text = f"{metas[0].title}\n{tldr}\n\nContributions:\n{contributions}"
-            try:
-                memory.vector.add(
-                    doc_id=f"paper:{arxiv_id}",
-                    content=summary_text,
-                    metadata={
-                        "type": "paper_note",
-                        "arxiv_id": arxiv_id,
-                        "method_name": result.get("_method_name", arxiv_id),
-                        "path": result.get("_note_path", ""),
-                        "tags": ",".join(result.get("tags", [])),
-                    },
-                )
-            except Exception:
-                pass  # 写入失败不影响主流程
-
         return ToolResult(success=True, content=result)
 
     return Tool(

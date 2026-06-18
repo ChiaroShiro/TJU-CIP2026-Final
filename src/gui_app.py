@@ -204,11 +204,29 @@ def _paper_brief(paper) -> Dict[str, Any]:
         "year": (getattr(paper, "published", "") or getattr(paper, "updated", "") or "")[:4],
         "code_url": getattr(paper, "code_url", ""),
         "has_code": bool(getattr(paper, "has_code", False)),
-        "code_confidence": round(float(getattr(paper, "code_confidence", 0.0) or 0.0), 3),
+        "code_confidence": round(_safe_float(getattr(paper, "code_confidence", 0.0)), 3),
     }
 
 
-def _figures_from_artifact(artifact) -> list:
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _asset_download_path(path: str, workspace_dir: Optional[Path] = None) -> str:
+    if not path:
+        return ""
+    if workspace_dir is None:
+        return str(path)
+    try:
+        return Path(path).resolve().relative_to(Path(workspace_dir).resolve()).as_posix()
+    except Exception:
+        return str(path)
+
+
+def _figures_from_artifact(artifact, workspace_dir: Optional[Path] = None) -> list:
     """把 SurveyArtifact 的演进图 / 海报 SVG 读成前端「图产物」契约（kind=svg）。
 
     survey 与 research 共用，保证两条链路产出同一形态、同等质量的图。
@@ -221,7 +239,7 @@ def _figures_from_artifact(artifact) -> list:
             "title": "算法演进图",
             "kind": "svg",
             "svg": evo_svg,
-            "download_path": artifact.evolution_file,
+            "download_path": _asset_download_path(artifact.evolution_file, workspace_dir),
             "meta": {"source": "survey_evolution",
                      "note": "多泳道演进图：纵轴为发布时间（越靠下越新），列为技术分支；实线=继承/改进，虚线=对比，绿点=有公开代码。"},
         })
@@ -234,7 +252,7 @@ def _figures_from_artifact(artifact) -> list:
             "title": "综述海报",
             "kind": "svg",
             "svg": poster_svg,
-            "download_path": artifact.poster_file,
+            "download_path": _asset_download_path(artifact.poster_file, workspace_dir),
             "meta": {"source": "survey_poster",
                      "note": "证据优先、公开代码优先的综述海报，尽力内联论文原图。"},
         })
@@ -376,12 +394,26 @@ def build_gui_app(orchestrator: "ResearchOrchestrator") -> ThreadingHTTPServer:
             file_path = _resolve_within(workspace_dir, note_path)
             if not file_path.exists():
                 raise FileNotFoundError("note not found")
+            kind, kind_label = self._note_kind(file_path)
             return {
                 "path": str(file_path),
                 "name": file_path.name,
                 "dir": str(file_path.parent),
                 "content": file_path.read_text(encoding="utf-8"),
+                "kind": kind,
+                "kind_label": kind_label,
             }
+
+        @staticmethod
+        def _note_kind(file_path: Path) -> Tuple[str, str]:
+            parts = set(file_path.parts)
+            if "paper_notes" in parts:
+                return "paper_note", "论文精读"
+            if "reports" in parts:
+                return "research_report", "研究报告"
+            if "surveys" in parts and file_path.name == "survey_report.md":
+                return "survey_report", "综述报告"
+            return "note", "笔记"
 
         # -------------------- GET -------------------- #
         def do_GET(self) -> None:
@@ -403,7 +435,7 @@ def build_gui_app(orchestrator: "ResearchOrchestrator") -> ThreadingHTTPServer:
                     return
                 if path == "/api/notes":
                     keyword = (query.get("q", [""])[0] or "").strip()
-                    notes = orchestrator.memory.find_paper_notes(keyword, top_k=50)
+                    notes = orchestrator.memory.find_paper_notes(keyword, top_k=80, include_reports=True)
                     self._send_json({"ok": True, "data": notes})
                     return
                 if path == "/api/note":
@@ -534,7 +566,7 @@ def build_gui_app(orchestrator: "ResearchOrchestrator") -> ThreadingHTTPServer:
             artifact = builder.build(topic, max_papers=max_papers, origin="survey")
 
             report_md = Path(artifact.report_file).read_text(encoding="utf-8")
-            figures = _figures_from_artifact(artifact)
+            figures = _figures_from_artifact(artifact, workspace_dir)
             papers = [
                 {
                     "title": p.title,
@@ -674,7 +706,7 @@ def build_gui_app(orchestrator: "ResearchOrchestrator") -> ThreadingHTTPServer:
             emit({"type": "phase", "label": "启动编排式研究流水线", "pct": 2})
             result = orchestrator.run_deep_research(topic, on_event=emit)
             critic_score = result.critic_reviews[-1].score if result.critic_reviews else None
-            figures = self._topic_figures(emit, topic)
+            figures = self._topic_figures(emit, topic, seed_papers=result.papers)
             emit({"type": "phase", "label": "完成", "pct": 100})
             emit({
                 "type": "result",
@@ -734,11 +766,10 @@ def build_gui_app(orchestrator: "ResearchOrchestrator") -> ThreadingHTTPServer:
             emit({"type": "phase", "label": "自主研究 Agent 启动", "pct": 2})
             result = manager.run(topic, on_event=inner)
 
-            output = result.final_output
-            if isinstance(output, dict):
-                report = output.get("output", "") or json.dumps(output, ensure_ascii=False)
-            else:
-                report = str(output) if output is not None else ""
+            report, report_source = self._auto_research_report(result)
+            if report_source == "save_research_episode":
+                emit({"type": "log", "level": "warn",
+                      "text": "finish 只返回了完成摘要，已改用归档步骤中的完整研究报告"})
 
             report_path = ""
             if result.finished and report:
@@ -746,7 +777,17 @@ def build_gui_app(orchestrator: "ResearchOrchestrator") -> ThreadingHTTPServer:
                 if report_buf["emitted"] == 0:
                     emit({"type": "token", "pane": "report", "text": report})
 
-            figures = self._topic_figures(emit, topic) if (result.finished and report) else []
+            if result.finished and report:
+                seed_papers = self._research_papers_from_steps(result.steps)
+                search_queries = self._research_queries_from_steps(result.steps)
+                figures = self._topic_figures(
+                    emit,
+                    topic,
+                    seed_papers=seed_papers,
+                    search_queries=search_queries,
+                )
+            else:
+                figures = []
             emit({"type": "phase", "label": "完成", "pct": 100})
             emit({
                 "type": "result",
@@ -775,7 +816,131 @@ def build_gui_app(orchestrator: "ResearchOrchestrator") -> ThreadingHTTPServer:
             path.write_text(report, encoding="utf-8")
             return str(path)
 
-        def _topic_figures(self, emit, topic: str) -> list:
+        def _auto_research_report(self, result) -> Tuple[str, str]:
+            """从自主研究结果中取最终报告。
+
+            Agent 有时会把完整正文传给 save_research_episode，却在 finish 里只写
+            "已完成..." 这类摘要。GUI 保存/展示时应优先保留完整报告。
+            """
+            finish_report = self._finish_output_text(getattr(result, "final_output", None))
+            archived_report = self._archived_report_from_steps(getattr(result, "steps", []))
+            if archived_report and self._should_prefer_archived_report(finish_report, archived_report):
+                return archived_report, "save_research_episode"
+            return finish_report or archived_report, "finish" if finish_report else "save_research_episode"
+
+        @staticmethod
+        def _finish_output_text(output) -> str:
+            if isinstance(output, dict):
+                return str(output.get("output", "") or json.dumps(output, ensure_ascii=False)).strip()
+            return str(output).strip() if output is not None else ""
+
+        @staticmethod
+        def _archived_report_from_steps(steps) -> str:
+            reports = []
+            for step in steps or []:
+                if getattr(step, "tool_name", "") != "save_research_episode":
+                    continue
+                args = getattr(step, "tool_args", {}) or {}
+                report = str(args.get("final_report", "") or "").strip()
+                if report:
+                    reports.append(report)
+            return reports[-1] if reports else ""
+
+        @staticmethod
+        def _should_prefer_archived_report(finish_report: str, archived_report: str) -> bool:
+            if not archived_report:
+                return False
+            if not finish_report:
+                return True
+            finish_len = len(finish_report.strip())
+            archived_len = len(archived_report.strip())
+            finish_looks_like_notice = (
+                finish_len < 1200
+                and ("已完成" in finish_report or "完成" in finish_report)
+                and ("报告" in finish_report)
+            )
+            archived_looks_like_markdown = (
+                archived_report.lstrip().startswith("#")
+                or "\n## " in archived_report
+                or archived_len >= 2000
+            )
+            return archived_looks_like_markdown and (
+                finish_looks_like_notice or archived_len > max(finish_len * 2, finish_len + 1000)
+            )
+
+        def _research_papers_from_steps(self, steps) -> list:
+            from .core.models import PaperItem
+
+            papers = []
+            seen = set()
+            for step in steps or []:
+                if getattr(step, "tool_name", "") not in {"search_arxiv", "search_semantic_scholar"}:
+                    continue
+                result = getattr(step, "tool_result", None)
+                content = getattr(result, "content", None)
+                if not result or not result.success or not isinstance(content, dict):
+                    continue
+                for item in content.get("papers") or []:
+                    if not isinstance(item, dict):
+                        continue
+                    title = str(item.get("title", "")).strip()
+                    if not title:
+                        continue
+                    paper_id = str(item.get("paper_id", "") or item.get("url", "") or title[:120]).strip()
+                    keys = {
+                        (paper_id or "").lower(),
+                        title.lower(),
+                    }
+                    keys.discard("")
+                    if seen.intersection(keys):
+                        continue
+                    seen.update(keys)
+                    code_urls = [
+                        str(url).strip()
+                        for url in (item.get("code_urls") or [])
+                        if str(url).strip()
+                    ]
+                    code_url = str(item.get("code_url", "") or (code_urls[0] if code_urls else "")).strip()
+                    if code_url and code_url not in code_urls:
+                        code_urls.insert(0, code_url)
+                    papers.append(
+                        PaperItem(
+                            paper_id=paper_id,
+                            title=title,
+                            authors=[str(a) for a in (item.get("authors") or [])],
+                            abstract=str(item.get("abstract", "") or ""),
+                            url=str(item.get("url", "") or ""),
+                            published=str(item.get("published", "") or ""),
+                            updated=str(item.get("updated", "") or ""),
+                            categories=[str(c) for c in (item.get("categories") or [])],
+                            code_urls=code_urls,
+                            code_url=code_url,
+                            code_repos=code_urls,
+                            has_code=bool(item.get("has_code") or code_url),
+                            code_confidence=_safe_float(item.get("code_confidence", 0.0)),
+                        )
+                    )
+            return papers
+
+        @staticmethod
+        def _research_queries_from_steps(steps) -> list:
+            queries = []
+            for step in steps or []:
+                if getattr(step, "tool_name", "") not in {"search_arxiv", "search_semantic_scholar"}:
+                    continue
+                args = getattr(step, "tool_args", {}) or {}
+                query = str(args.get("query", "") or "").strip()
+                if query and query not in queries:
+                    queries.append(query)
+            return queries
+
+        def _topic_figures(
+            self,
+            emit,
+            topic: str,
+            seed_papers: Optional[list] = None,
+            search_queries: Optional[list] = None,
+        ) -> list:
             """研究结束后，为主题生成算法演进图 + 海报（与 survey 同质同源）。
 
             best-effort：任何失败都只记一条日志、返回空列表，绝不影响报告交付。
@@ -784,8 +949,25 @@ def build_gui_app(orchestrator: "ResearchOrchestrator") -> ThreadingHTTPServer:
                 emit({"type": "phase", "label": "生成算法演进图与海报", "pct": 97})
                 from .services.survey_builder import SurveyBuilder
                 builder = SurveyBuilder(workspace_dir, llm=orchestrator.llm, memory=orchestrator.memory)
-                artifact = builder.build(topic, max_papers=12, origin="research")
-                return _figures_from_artifact(artifact)
+                seed_papers = seed_papers or []
+                search_queries = search_queries or []
+                if seed_papers:
+                    emit({"type": "log", "level": "info",
+                          "text": f"复用本次研究检索到的 {len(seed_papers)} 篇论文生成图"})
+                elif search_queries:
+                    emit({"type": "log", "level": "info",
+                          "text": f"使用本次研究的英文检索式生成图：{search_queries[0]}"})
+                artifact = builder.build(
+                    topic,
+                    max_papers=12,
+                    origin="research",
+                    seed_papers=seed_papers,
+                    search_queries=search_queries,
+                )
+                if not artifact.papers:
+                    emit({"type": "log", "level": "warn",
+                          "text": "未检索到可用于演进图的论文，已生成空图模板"})
+                return _figures_from_artifact(artifact, workspace_dir)
             except Exception as exc:
                 emit({"type": "log", "level": "warn",
                       "text": f"演进图/海报生成跳过：{type(exc).__name__}: {exc}"})

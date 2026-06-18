@@ -21,6 +21,12 @@ def _papers_to_dicts(papers: List) -> List[dict]:
             "abstract": (p.abstract or "")[:400],
             "url": p.url,
             "published": p.published,
+            "updated": p.updated,
+            "categories": p.categories,
+            "code_urls": p.code_urls,
+            "code_url": p.code_url,
+            "has_code": p.has_code,
+            "code_confidence": p.code_confidence,
         }
         for p in papers
     ]

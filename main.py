@@ -218,13 +218,13 @@ def survey(
     无 API key 也可运行：演进图按 arXiv 主类目确定性分泳道；
     配置 LLM key 后，演进图升级为 LLM 划分技术分支 + 继承/对比关系。
     """
-    root = Path(__file__).parent
-    settings = Settings.from_env(root)
-    # 有 key 时演进图走 LLM 版（分支 + 继承/对比），无 key 自动降级为确定性启发式
-    builder = SurveyBuilder(settings.workspace_dir, llm=LLMClient(settings))
+    orch = get_orchestrator()
+    # 有 key 时演进图走 LLM 版（分支 + 继承/对比），无 key 自动降级为确定性启发式；
+    # 传入 memory，使演进图的论文/关系并入论文图谱（与 GUI survey 行为一致）
+    builder = SurveyBuilder(orch.settings.workspace_dir, llm=orch.llm, memory=orch.memory)
 
     with console.status("正在生成综述、演进图和海报..."):
-        artifact = builder.build(topic, max_papers=max_papers)
+        artifact = builder.build(topic, max_papers=max_papers, origin="survey")
 
     console.print(Panel("[bold green]综述产物已生成[/bold green]", border_style="green"))
     console.print(f"报告: {artifact.report_file}")

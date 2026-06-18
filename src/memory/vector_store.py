@@ -44,14 +44,18 @@ class VectorMemory:
 
     def add(self, doc_id: str, content: str, metadata: Dict[str, str]) -> None:
         """
-        添加文档到向量数据库
+        添加/更新文档到向量数据库（幂等）。
+
+        用 upsert 而非 add：同一 doc_id 重复写入时会更新内容而不是告警/抛错。
+        这样重复分析同一篇论文（paper:{id}）能刷新摘要，且不会因“ID 已存在”
+        中断后续的图谱写入（save_paper_note 中向量写在前、图谱写在后）。
 
         Args:
             doc_id: 文档唯一ID
             content: 文档内容（会自动生成embedding）
             metadata: 元数据（如标题、时间戳等）
         """
-        self.collection.add(
+        self.collection.upsert(
             ids=[doc_id],
             documents=[content],
             metadatas=[metadata]

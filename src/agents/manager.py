@@ -137,7 +137,8 @@ class ResearchManager(BaseAgent):
         self.s2 = SemanticScholarSearcher()
         self.github = GitHubCodeSearcher()
         self.fetcher = PaperFetcher(settings.workspace_dir / "pdf_cache")
-        self.analyzer = PaperAnalyzer(LLMClient(settings), settings)
+        # 注入 memory：analyze() 会经 save_paper_note 同时写入向量库与论文图谱
+        self.analyzer = PaperAnalyzer(LLMClient(settings), settings, memory=self.memory)
         self.web = WebSearcher()
 
         # 初始化 BaseAgent（会调用 build_tools + system_prompt）
@@ -157,7 +158,8 @@ class ResearchManager(BaseAgent):
         registry.register(build_s2_search_tool(self.s2))
         registry.register(build_github_code_search_tool(self.github))
         registry.register(build_fetch_fulltext_tool(self.fetcher))
-        registry.register(build_analyze_paper_tool(self.analyzer, self.arxiv, self.memory))
+        # analyzer 已注入 memory，分析后自行持久化（向量库 + 论文图谱），工具不再重复写
+        registry.register(build_analyze_paper_tool(self.analyzer, self.arxiv))
         registry.register(build_retrieve_memory_tool(self.memory))
         registry.register(build_save_note_tool(self.memory))
         registry.register(build_save_research_episode_tool(self.memory, self.reflection))

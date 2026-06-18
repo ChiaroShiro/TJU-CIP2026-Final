@@ -10,18 +10,52 @@ from __future__ import annotations
 import base64
 import html
 import json
+import logging
 import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from ..core.models import PaperItem, SurveyArtifact
+from ..core.utils import extract_json_object
 from .evolution_graph import EvolutionGraphBuilder
 from .paper_figure_fetcher import PaperFigureFetcher
 from .paper_search import PaperDiscoveryService
 
 
+logger = logging.getLogger(__name__)
+
 _ARXIV_ID_RE = re.compile(r"^\d{4}\.\d{4,5}(v\d+)?$")
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+
+_CN_QUERY_TERMS = [
+    ("大语言模型", "large language model"),
+    ("语言模型", "language model"),
+    ("多智能体", "multi-agent"),
+    ("智能体", "agent"),
+    ("代理", "agent"),
+    ("世界模型", "world model"),
+    ("扩散模型", "diffusion model"),
+    ("扩散语言模型", "diffusion language model"),
+    ("强化学习", "reinforcement learning"),
+    ("自监督", "self-supervised"),
+    ("多模态", "multimodal"),
+    ("视觉语言", "vision language"),
+    ("图神经网络", "graph neural network"),
+    ("语音表示", "speech representation"),
+    ("文献综述", "literature review"),
+    ("推理", "reasoning"),
+    ("规划", "planning"),
+    ("反思", "reflection"),
+    ("优化", "optimization"),
+    ("加速", "acceleration"),
+    ("对齐", "alignment"),
+    ("检索增强", "retrieval augmented generation"),
+    ("演化", "evolution"),
+    ("演进", "evolution"),
+    ("技术", "techniques"),
+    ("技巧", "techniques"),
+]
 
 
 class SurveyBuilder:
@@ -40,15 +74,20 @@ class SurveyBuilder:
         output_name: Optional[str] = None,
         with_figures: bool = True,
         origin: str = "survey",
+        seed_papers: Optional[List[PaperItem]] = None,
+        search_queries: Optional[List[str]] = None,
     ) -> SurveyArtifact:
         safe_name = output_name or self._safe_filename(topic)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         out_dir = self.output_root / f"{timestamp}_{safe_name}"
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        papers = self.discovery.search_topic(topic, max_results=max_papers)
-        papers = self.discovery.enrich_with_code(papers, max_code_hits=3)
-        papers = papers[:max_papers]
+        papers = self._collect_papers(
+            topic=topic,
+            max_papers=max_papers,
+            seed_papers=seed_papers,
+            search_queries=search_queries,
+        )
 
         raw_data_path = out_dir / "papers.json"
         raw_data_path.write_text(
@@ -65,8 +104,9 @@ class SurveyBuilder:
         if self.memory is not None:
             try:
                 self.memory.merge_evolution_graph(papers, evo, origin=origin)
-            except Exception:
-                pass
+            except Exception as exc:
+                # 合并失败不影响综述/演进图/海报产物，但不再静默吞掉
+                logger.warning("演进图合并到论文图谱失败: %s", exc)
 
         # 海报（尽力嵌入论文原图）
         figures_map = self._collect_poster_figures(papers, out_dir) if with_figures else {}
@@ -88,6 +128,151 @@ class SurveyBuilder:
             evolution_file=str(evolution_path),
             raw_data_file=str(raw_data_path),
         )
+
+    def _collect_papers(
+        self,
+        topic: str,
+        max_papers: int,
+        seed_papers: Optional[List[PaperItem]] = None,
+        search_queries: Optional[List[str]] = None,
+    ) -> List[PaperItem]:
+        """收集图/综述用论文。
+
+        GUI 深度研究已经检索过英文论文；这里优先复用这些结果，避免研究主题是中文时
+        又拿中文直接查 arXiv/S2 导致 papers.json 为空。直达 survey 路径会为中文主题
+        生成英文检索兜底，再尝试原主题。
+        """
+        papers = self._dedupe_papers(seed_papers or [])
+        queries = self._build_search_queries(topic, search_queries)
+        searched_queries = set()
+
+        for query in queries:
+            if len(papers) >= max_papers:
+                break
+            searched_queries.add(query)
+            try:
+                found = self.discovery.search_topic(query, max_results=max_papers - len(papers))
+            except Exception as exc:
+                logger.warning("论文检索失败 query=%r: %s", query, exc)
+                continue
+            papers = self._dedupe_papers([*papers, *found])
+
+        if not papers and self._contains_cjk(topic):
+            for query in self._llm_search_queries(topic):
+                if len(papers) >= max_papers or query in searched_queries:
+                    continue
+                searched_queries.add(query)
+                try:
+                    found = self.discovery.search_topic(query, max_results=max_papers - len(papers))
+                except Exception as exc:
+                    logger.warning("LLM 兜底论文检索失败 query=%r: %s", query, exc)
+                    continue
+                papers = self._dedupe_papers([*papers, *found])
+
+        if not papers:
+            return []
+
+        enriched = self.discovery.enrich_with_code(papers[:max_papers], max_code_hits=3)
+        return self._dedupe_papers(enriched)[:max_papers]
+
+    @staticmethod
+    def _dedupe_papers(papers: List[PaperItem]) -> List[PaperItem]:
+        deduped: List[PaperItem] = []
+        seen = set()
+        for paper in papers or []:
+            if not paper or not paper.title:
+                continue
+            keys = {
+                (paper.paper_id or "").strip().lower(),
+                (paper.url or "").strip().lower(),
+                paper.title.strip().lower(),
+            }
+            keys.discard("")
+            if not keys or seen.intersection(keys):
+                continue
+            seen.update(keys)
+            deduped.append(paper)
+        return deduped
+
+    def _build_search_queries(
+        self,
+        topic: str,
+        search_queries: Optional[List[str]] = None,
+    ) -> List[str]:
+        """生成论文检索式，中文主题优先用便宜的英文兜底。
+
+        arXiv / Semantic Scholar 对中文 query 覆盖很差。深度研究路径会传入 Agent
+        已经用过的英文 query；Survey 直达路径没有这些 query 时，这里做轻量改写。
+        LLM 改写只在这些检索式完全失败后才触发，避免图生成依赖额外 API 调用。
+        """
+        queries: List[str] = []
+
+        def add(query: str) -> None:
+            query = (query or "").strip()
+            if query and query not in queries:
+                queries.append(query)
+
+        for query in search_queries or []:
+            add(query)
+
+        topic_text = (topic or "").strip()
+        if topic_text and self._contains_cjk(topic_text):
+            add(self._heuristic_english_query(topic_text))
+
+        add(topic_text)
+        return queries
+
+    @staticmethod
+    def _contains_cjk(text: str) -> bool:
+        return bool(_CJK_RE.search(text or ""))
+
+    def _llm_search_queries(self, topic: str) -> List[str]:
+        if self.llm is None or not getattr(self.llm, "available", False):
+            return []
+        try:
+            text = self.llm.invoke(
+                [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You rewrite Chinese research topics into concise English academic "
+                            "paper search queries. Return JSON only."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Topic: {topic}\n"
+                            "Return {\"queries\": [..]} with 2-3 English queries for arXiv "
+                            "and Semantic Scholar. Each query should be under 12 words."
+                        ),
+                    },
+                ],
+                temperature=0.0,
+            )
+            data = extract_json_object(text)
+            raw_queries = data.get("queries") if isinstance(data, dict) else []
+            queries = []
+            for query in raw_queries or []:
+                query = re.sub(r"\s+", " ", str(query or "")).strip()
+                if 3 <= len(query) <= 140 and query not in queries:
+                    queries.append(query)
+            return queries[:3]
+        except Exception as exc:
+            logger.warning("中文主题英文检索式生成失败: %s", exc)
+            return []
+
+    @staticmethod
+    def _heuristic_english_query(topic: str) -> str:
+        ascii_terms = re.findall(r"[A-Za-z][A-Za-z0-9+_.-]*", topic or "")
+        terms: List[str] = []
+        for term in ascii_terms:
+            if term not in terms:
+                terms.append(term)
+        for cn, en in _CN_QUERY_TERMS:
+            if cn in (topic or "") and en not in terms:
+                terms.append(en)
+        return " ".join(terms[:10])
 
     # ------------------------------------------------------------------ #
     # 综述报告

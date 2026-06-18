@@ -1,3 +1,4 @@
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -155,51 +156,88 @@ class MemoryManager:
     def get_relevant_skills(self, query: str, limit: int = 5) -> list:
         return self.skill.find_relevant(query, limit=limit)
 
-    def find_paper_notes(self, query: str, top_k: int = 5) -> List[Dict[str, str]]:
-        notes_dir = self.vector.persist_dir.parent / "paper_notes"
-        if not notes_dir.exists():
-            return []
-
+    def find_paper_notes(
+        self,
+        query: str,
+        top_k: int = 5,
+        include_reports: bool = False,
+    ) -> List[Dict[str, str]]:
+        workspace_dir = self.vector.persist_dir.parent
+        notes_dir = workspace_dir / "paper_notes"
         query_lower = (query or "").lower().strip()
         matches: List[Dict[str, str]] = []
-        for path in sorted(notes_dir.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True):
+
+        candidates = []
+        if notes_dir.exists():
+            candidates.extend(
+                (path, "paper_note", "论文精读", "精读生成的结构化论文笔记")
+                for path in notes_dir.glob("*.md")
+            )
+        if include_reports:
+            reports_dir = workspace_dir / "reports"
+            if reports_dir.exists():
+                candidates.extend(
+                    (path, "research_report", "研究报告", "自主 Research 生成的完整报告")
+                    for path in reports_dir.glob("*.md")
+                )
+            surveys_dir = workspace_dir / "surveys"
+            if surveys_dir.exists():
+                candidates.extend(
+                    (path, "survey_report", "综述报告", "文献综述、演进图和海报的配套报告")
+                    for path in surveys_dir.glob("*/survey_report.md")
+                )
+
+        candidates = sorted(candidates, key=lambda item: item[0].stat().st_mtime, reverse=True)
+
+        for path, kind, kind_label, description in candidates:
             try:
                 content = path.read_text(encoding="utf-8")
             except Exception:
                 continue
 
             if query_lower:
-                title_match = query_lower in path.stem.lower()
+                title = self._display_note_title(path, kind)
+                title_match = query_lower in title.lower() or query_lower in path.stem.lower()
                 content_match = query_lower in content.lower()
                 if not (title_match or content_match):
                     continue
 
             matches.append(
                 {
-                    "title": path.stem,
-                    "path": str(path),
+                    "title": self._display_note_title(path, kind),
+                    "path": self._note_api_path(path, workspace_dir),
                     "preview": content[:1200],
+                    "kind": kind,
+                    "kind_label": kind_label,
+                    "description": description,
+                    "updated_at": datetime.fromtimestamp(path.stat().st_mtime).isoformat(),
+                    "size": str(path.stat().st_size),
                 }
             )
             if len(matches) >= top_k:
                 break
 
-        if matches or query_lower:
-            return matches
-
-        for path in sorted(notes_dir.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)[:top_k]:
-            try:
-                content = path.read_text(encoding="utf-8")
-            except Exception:
-                continue
-            matches.append(
-                {
-                    "title": path.stem,
-                    "path": str(path),
-                    "preview": content[:1200],
-                }
-            )
         return matches
+
+    @staticmethod
+    def _display_note_title(path: Path, kind: str) -> str:
+        if kind == "survey_report":
+            return MemoryManager._strip_note_timestamp(path.parent.name)
+        return MemoryManager._strip_note_timestamp(path.stem)
+
+    @staticmethod
+    def _strip_note_timestamp(text: str) -> str:
+        stem = text or ""
+        if len(stem) >= 16 and stem[:8].isdigit() and stem[8] == "_" and stem[15] == "_":
+            return stem[16:] or stem
+        return stem
+
+    @staticmethod
+    def _note_api_path(path: Path, workspace_dir: Path) -> str:
+        try:
+            return path.resolve().relative_to(workspace_dir.resolve()).as_posix()
+        except Exception:
+            return str(path)
 
     def get_related_read_papers(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
         graph_hits = self.paper_graph.search_papers(query, limit=top_k)
@@ -321,48 +359,61 @@ class MemoryManager:
         for node in nodes:
             node_map[node.paper_id] = self._serialize_paper_node(node)
 
-        edges = []
-        seen_edges = set()
+        # 同一有向 (src, dst) 对可能有多条不同 relation_type/source_kind 的边。
+        # 在收集阶段就按端点折叠为单条代表边（取优先级最高的），并让 edge_limit
+        # 约束“不同对”的数量——避免平行边提前占满配额、挤掉同节点的其他邻居关系。
+        edges_by_pair: Dict[Any, Dict[str, Any]] = {}
+        pair_order: List[Any] = []
 
-        def _append_edge(edge) -> None:
-            key = (
-                edge.src_paper_id,
-                edge.dst_paper_id,
-                edge.relation_type,
-                edge.source_kind,
-            )
-            if key in seen_edges or len(edges) >= edge_limit:
-                return
-            seen_edges.add(key)
-            edges.append(self._serialize_paper_edge(edge))
+        def _consider_edge(edge) -> None:
+            ser = self._serialize_paper_edge(edge)
+            key = (ser["src_paper_id"], ser["dst_paper_id"])
+            existing = edges_by_pair.get(key)
+            if existing is None:
+                if len(edges_by_pair) >= edge_limit:
+                    return  # 已达“不同对”上限
+                edges_by_pair[key] = ser
+                pair_order.append(key)
+                # 仅为真正纳入的边补齐端点节点
+                for pid in key:
+                    if pid not in node_map:
+                        n2 = self.paper_graph.get_paper(pid)
+                        if n2:
+                            node_map[pid] = self._serialize_paper_node(n2)
+            elif self._edge_rank(ser) > self._edge_rank(existing):
+                edges_by_pair[key] = ser  # 同对保留更高优先级，不增计数
 
         if include_neighbors:
+            # 每个节点多取些原始边（留足折叠余量），避免某节点的并行边在 SQL limit
+            # 内把它的其他邻居挤掉
+            neighbor_fetch = max(24, edge_limit // 2)
             for node in nodes:
-                for edge in self.paper_graph.get_neighbors(node.paper_id, limit=12):
-                    _append_edge(edge)
-                    if edge.src_paper_id not in node_map:
-                        src = self.paper_graph.get_paper(edge.src_paper_id)
-                        if src:
-                            node_map[src.paper_id] = self._serialize_paper_node(src)
-                    if edge.dst_paper_id not in node_map:
-                        dst = self.paper_graph.get_paper(edge.dst_paper_id)
-                        if dst:
-                            node_map[dst.paper_id] = self._serialize_paper_node(dst)
-                    if len(edges) >= edge_limit:
-                        break
-                if len(edges) >= edge_limit:
-                    break
+                for edge in self.paper_graph.get_neighbors(node.paper_id, limit=neighbor_fetch):
+                    _consider_edge(edge)
         else:
-            for edge in self.paper_graph.list_edges(limit=edge_limit):
+            # 多取些行，折叠后再受 edge_limit（按不同对）约束
+            for edge in self.paper_graph.list_edges(limit=edge_limit * 4):
                 if edge.src_paper_id in node_map or edge.dst_paper_id in node_map:
-                    _append_edge(edge)
+                    _consider_edge(edge)
 
         return {
             "query": query,
             "nodes": list(node_map.values()),
-            "edges": edges,
+            "edges": [edges_by_pair[k] for k in pair_order],
             "stats": self.stats(),
         }
+
+    # 关系类型优先级：继承/改进 > 对比 > 相似；来源优先级：精读显式 > 演进合并 > 推断
+    _REL_PRIORITY = {"builds_on": 3, "compares_with": 2, "similar_to": 1}
+    _SRC_PRIORITY = {"explicit": 3, "evolution": 2, "inferred": 1}
+
+    @classmethod
+    def _edge_rank(cls, edge: Dict[str, Any]):
+        return (
+            cls._REL_PRIORITY.get(edge.get("relation_type", ""), 0),
+            float(edge.get("relation_strength") or 0.0),
+            cls._SRC_PRIORITY.get(edge.get("source_kind", ""), 0),
+        )
 
     def _compute_graph_match_confidence(self, node, query: str) -> float:
         query_lower = (query or "").strip().lower()
@@ -692,7 +743,8 @@ class MemoryManager:
             "skills": self.skill.count(),
             "vectors": self.vector.count(),
             "paper_nodes": self.paper_graph.count_nodes(),
-            "paper_edges": self.paper_graph.count_edges(),
+            # 按有向 (src, dst) 对去重，与图谱视图“每对一条边”口径一致，避免同对多关系把边数撑大
+            "paper_edges": self.paper_graph.count_unique_edges(),
         }
 
     @staticmethod

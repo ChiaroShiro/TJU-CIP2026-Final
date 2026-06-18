@@ -266,8 +266,17 @@ class PaperGraphMemory:
             return conn.execute("SELECT COUNT(*) FROM paper_nodes").fetchone()[0]
 
     def count_edges(self) -> int:
+        """边的总行数（同一对节点的不同 relation_type/source_kind 会各算一行）。"""
         with self._conn() as conn:
             return conn.execute("SELECT COUNT(*) FROM paper_edges").fetchone()[0]
+
+    def count_unique_edges(self) -> int:
+        """按有向 (src, dst) 对去重后的关系数——与图谱视图“每对一条边”一致，更直观。"""
+        with self._conn() as conn:
+            return conn.execute(
+                "SELECT COUNT(*) FROM "
+                "(SELECT DISTINCT src_paper_id, dst_paper_id FROM paper_edges)"
+            ).fetchone()[0]
 
     def _to_paper_node(self, row) -> PaperNode:
         return PaperNode(

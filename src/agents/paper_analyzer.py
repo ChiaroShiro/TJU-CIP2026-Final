@@ -8,6 +8,7 @@ Modes:
 """
 
 import base64
+import logging
 import re
 from datetime import datetime
 from pathlib import Path
@@ -23,6 +24,8 @@ from ..memory.memory_manager import MemoryManager
 from ..services.paper_fetcher import PaperFetcher, PaperFullText
 from ..services.paper_figure_fetcher import FigureRef, PaperFigureFetcher
 
+
+logger = logging.getLogger(__name__)
 
 SECTION_ORDER = [
     "abstract",
@@ -216,8 +219,9 @@ class PaperAnalyzer:
         if self.memory is not None:
             try:
                 self.memory.save_paper_note(paper.paper_id, paper.title, analysis)
-            except Exception:
-                pass
+            except Exception as exc:
+                # 保持 best-effort（不中断笔记产出），但不再静默吞掉
+                logger.warning("保存论文图谱失败 (%s): %s", paper.paper_id, exc)
 
     def _fetch_figures(self, paper: PaperItem) -> List[FigureRef]:
         method_name = self._extract_method_name_from_title(paper.title)

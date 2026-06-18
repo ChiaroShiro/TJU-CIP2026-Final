@@ -776,7 +776,15 @@ async function clearChat() {
 }
 
 /* ------------------------------ 图谱（d3 力导向 + 降级） ------------------------------ */
-const graphState = { sim: null, zoom: null, svg: null, snapshot: null, activeLayers: new Set(GRAPH_LAYERS) };
+const graphState = {
+  sim: null,
+  zoom: null,
+  svg: null,
+  snapshot: null,
+  fitNodes: [],
+  fitTransform: null,
+  activeLayers: new Set(GRAPH_LAYERS),
+};
 function edgeColor(type) { return EDGE_COLORS[type] || EDGE_COLORS.similar_to; }
 function nodeLayer(n) {
   if (n.layer) return n.layer;
@@ -915,19 +923,65 @@ function zoomBy(factor) { if (graphState.svg && graphState.zoom) graphState.svg.
 function resetGraph() { if (graphState.svg && graphState.zoom && window.d3) graphState.svg.transition().duration(300).call(graphState.zoom.transform, window.d3.zoomIdentity); }
 
 /* ------------------------------ 笔记 ------------------------------ */
+function noteKindMeta(kind) {
+  const map = {
+    paper_note: { label: "论文精读", hint: "结构化论文笔记", action: "查看笔记" },
+    research_report: { label: "研究报告", hint: "自主 Research 完整报告", action: "打开报告" },
+    survey_report: { label: "综述报告", hint: "文献综述与图产物报告", action: "打开综述" },
+  };
+  return map[kind] || { label: "笔记", hint: "Markdown 文档", action: "查看" };
+}
+function compactPreview(text) {
+  return String(text || "")
+    .replace(/^---[\s\S]*?---\s*/m, "")
+    .replace(/[#*_`>\-|[\]()]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+function formatNoteDate(value) {
+  if (!value) return "";
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return "";
+  return d.toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+}
+function cleanNoteTitle(text) {
+  return String(text || "")
+    .replace(/\.md$/i, "")
+    .replace(/^\d{8}_\d{6}_/, "")
+    .trim();
+}
+function noteDisplayTitle(data) {
+  const path = data.path || "";
+  if (data.kind === "survey_report") {
+    const parts = path.split(/[\\/]/).filter(Boolean);
+    return cleanNoteTitle(parts.length >= 2 ? parts[parts.length - 2] : data.name);
+  }
+  return cleanNoteTitle(data.name || path.split(/[\\/]/).pop() || "Markdown");
+}
 function renderNotes(items) {
   const host = $("n-list");
   const n = (items || []).length;
   const countEl = $("n-count");
-  if (countEl) countEl.textContent = n ? `共 ${n} 篇笔记${n >= 50 ? "（仅显示前 50，可用关键词筛选）" : ""}` : "";
-  if (!items || !items.length) { host.innerHTML = emptyState("📭", "没有匹配到笔记", "先精读一篇论文"); return; }
-  host.innerHTML = items.map((it) => `
-    <div class="list-item">
+  if (countEl) countEl.textContent = n ? `共 ${n} 条资料${n >= 80 ? "（仅显示前 80，可用关键词筛选）" : ""}` : "";
+  if (!items || !items.length) { host.innerHTML = emptyState("📭", "没有匹配到资料", "先精读论文，或完成一次 Research / 综述"); return; }
+  host.innerHTML = items.map((it) => {
+    const kind = it.kind || "paper_note";
+    const meta = noteKindMeta(kind);
+    const preview = compactPreview(it.preview).slice(0, 170);
+    const date = formatNoteDate(it.updated_at);
+    return `
+    <div class="list-item note-item note-item--${escapeHtml(kind)}">
+      <div class="note-item-top">
+        <span class="note-kind note-kind--${escapeHtml(kind)}">${escapeHtml(it.kind_label || meta.label)}</span>
+        ${date ? `<span class="note-date">${escapeHtml(date)}</span>` : ""}
+      </div>
       <div class="li-title">${escapeHtml(it.title || "")}</div>
-      <div class="li-meta">${escapeHtml(it.path || "")}</div>
-      <div class="li-meta" style="margin-top:6px;">${escapeHtml((it.preview || "").slice(0, 160))}</div>
-      <div class="li-actions"><button class="btn btn-ghost btn-sm js-note" data-path="${escapeHtml(it.path || "")}">查看笔记</button></div>
-    </div>`).join("");
+      <div class="li-meta note-desc">${escapeHtml(it.description || meta.hint)}</div>
+      <div class="li-meta note-path">${escapeHtml(it.path || "")}</div>
+      <div class="li-meta note-preview">${escapeHtml(preview)}${preview.length >= 170 ? "…" : ""}</div>
+      <div class="li-actions"><button class="btn btn-ghost btn-sm js-note" data-path="${escapeHtml(it.path || "")}">${escapeHtml(meta.action)}</button></div>
+    </div>`;
+  }).join("");
   host.querySelectorAll(".js-note").forEach((b) => b.addEventListener("click", () => openNote(b.dataset.path || "").catch((e) => toast(String(e.message || e), "bad"))));
 }
 async function loadNotes(query = "") {
@@ -941,9 +995,20 @@ async function openNote(path) {
   if (!path) throw new Error("笔记路径为空");
   const data = await apiPost("/api/open-note", { path });
   const baseDir = data.dir || (data.path || "").replace(/[\\/][^\\/]*$/, "");
-  $("n-viewer").innerHTML = `<div class="markdown-body">${renderMarkdownWithAssets(data.content || "", baseDir)}</div>`;
+  const kind = data.kind || "note";
+  const meta = noteKindMeta(kind);
+  $("n-viewer").innerHTML = `
+    <div class="note-doc-head note-doc-head--${escapeHtml(kind)}">
+      <div>
+        <span class="note-kind note-kind--${escapeHtml(kind)}">${escapeHtml(data.kind_label || meta.label)}</span>
+        <h2>${escapeHtml(noteDisplayTitle(data))}</h2>
+      </div>
+      <p>${escapeHtml(meta.hint)}</p>
+      <code>${escapeHtml(data.path || "")}</code>
+    </div>
+    <div class="markdown-body note-doc-body note-doc-body--${escapeHtml(kind)}">${renderMarkdownWithAssets(data.content || "", baseDir)}</div>`;
   $("n-viewer").scrollTop = 0;
-  toast("笔记已加载", "good");
+  toast(`${meta.label}已加载`, "good");
 }
 
 /* ------------------------------ 浮层 ------------------------------ */

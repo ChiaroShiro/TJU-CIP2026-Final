@@ -136,7 +136,8 @@ class PaperDiscoveryService:
         for idx, paper in enumerate(papers):
             emit({"type": "phase", "label": f"关联 GitHub 代码 ({idx + 1}/{total})",
                   "pct": 40 + int(55 * (idx + 1) / max(1, total))})
-            code_urls = self._collect_code_urls(paper)
+            code_urls = self._existing_code_urls(paper) + self._collect_code_urls(paper)
+            code_urls = self._dedupe_urls(code_urls)
             code_confidence = 1.0 if code_urls else 0.0
             if not code_urls:
                 code_hits = self.github.search_repo_for_paper(
@@ -174,6 +175,29 @@ class PaperDiscoveryService:
             reverse=True,
         )
 
+    @staticmethod
+    def _existing_code_urls(paper: PaperItem) -> List[str]:
+        urls: List[str] = []
+        for value in [paper.code_url, *(paper.code_urls or []), *(paper.code_repos or [])]:
+            value = str(value or "").strip()
+            if value.startswith(("http://", "https://")):
+                urls.append(value)
+        return urls
+
+    @staticmethod
+    def _dedupe_urls(urls: List[str]) -> List[str]:
+        seen = set()
+        cleaned = []
+        for url in urls or []:
+            url = str(url or "").strip()
+            if not url.startswith(("http://", "https://")):
+                continue
+            if url in seen:
+                continue
+            seen.add(url)
+            cleaned.append(url)
+        return cleaned
+
     def _dedupe_and_rank(self, query: str, papers: List[PaperItem]) -> List[PaperItem]:
         seen = set()
         deduped: List[PaperItem] = []
@@ -196,13 +220,7 @@ class PaperDiscoveryService:
         candidates = []
         for text in [paper.url, paper.abstract, paper.title]:
             candidates.extend(self.github.extract_repos_from_text(text))
-        seen = set()
-        cleaned = []
-        for url in candidates:
-            if url not in seen:
-                seen.add(url)
-                cleaned.append(url)
-        return cleaned
+        return self._dedupe_urls(candidates)
 
     @staticmethod
     def _published_year(value: str) -> int:

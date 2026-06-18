@@ -22,10 +22,12 @@ Thumbs.db
 # ───── Runtime workspace (研究产物不上传) ─────
 workspace/reports/
 workspace/notes/
+workspace/paper_notes/
 workspace/pdf_cache/
 workspace/vector_db/
 workspace/memory/
 workspace/surveys/
+workspace/visual_checks/
 
 # ───── Markdown 文档（除根目录 README.md 外全部忽略）─────
 *.md
